@@ -1,4 +1,3 @@
-```markdown
 # Structure From Motion (SfM) - README
 
 ## Overview
