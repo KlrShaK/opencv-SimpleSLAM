@@ -124,7 +124,6 @@ python sfm_lightglue_aliked.py --dataset kitti --data_path ./Dataset/kitti --use
   - BFMatcher or FLANN for matching.  
   - Essential matrix / PnP for pose.  
   - Minimal keyframe selection logic.  
-  - Optional pose refinement using `least_squares`.
 
 - **sfm_lightglue_aliked.py**
   - ALIKED for learned keypoints + descriptors, LightGlue for matching.  
