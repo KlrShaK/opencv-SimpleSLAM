@@ -26,13 +26,19 @@ def get_detector(detector_type, max_features=6000):
         return cv2.AKAZE_create()
     raise ValueError(f"Unsupported detector: {detector_type}")
 
-
 def get_matcher(matcher_type, detector_type=None):
     if matcher_type == 'bf':
         norm = cv2.NORM_HAMMING if detector_type in ['orb','akaze'] else cv2.NORM_L2
         return cv2.BFMatcher(norm, crossCheck=True)
     raise ValueError(f"Unsupported matcher: {matcher_type}")
 
+def feature_detect_and_match(img1,img2,detector,matcher):
+    kp1,des1=detector.detectAndCompute(img1,None)
+    kp2,des2=detector.detectAndCompute(img2,None)
+    if des1 is None or des2 is None:
+        return [],[],[]
+    matches=matcher.match(des1,des2)
+    return kp1,kp2,sorted(matches,key=lambda m:m.distance)
 
 def bgr_to_tensor(image):
     """Convert a OpenCV‐style BGR uint8 into (3,H,W) torch tensor in [0,1] ."""
@@ -68,7 +74,6 @@ def convert_lightglue_to_opencv(keypoints0, keypoints1, matches):
 
         return opencv_kp0, opencv_kp1, opencv_matches
 
-
 def lightglue_match(img1, img2, extractor, matcher, min_conf=0.0):
         """
         Uses ALIKED and LightGlue to extract features and match them,
@@ -101,16 +106,6 @@ def lightglue_match(img1, img2, extractor, matcher, min_conf=0.0):
         opencv_kp0, opencv_kp1, opencv_matches = convert_lightglue_to_opencv(keypoints0, keypoints1, matches)
         
         return opencv_kp0, opencv_kp1, opencv_matches
-
-def feature_detect_and_match(img1,img2,detector,matcher):
-    kp1,des1=detector.detectAndCompute(img1,None)
-    kp2,des2=detector.detectAndCompute(img2,None)
-    if des1 is None or des2 is None:
-        return [],[],[]
-    matches=matcher.match(des1,des2)
-    return kp1,kp2,sorted(matches,key=lambda m:m.distance)
-
-import cv2
 
 def update_and_prune_tracks(matches, prev_map, tracks, kp_curr, frame_idx, next_track_id, prune_age=30):
     """
@@ -163,6 +158,39 @@ def update_and_prune_tracks(matches, prev_map, tracks, kp_curr, frame_idx, next_
 
     return curr_map, tracks, next_track_id
 
+def filter_matches_ransac(kp1, kp2, matches, thresh):
+    """
+    Filter a list of cv2.DMatch objects using RANSAC on the fundamental matrix.
+
+    Args:
+        kp1      (List[cv2.KeyPoint]): KeyPoints from the first image.
+        kp2      (List[cv2.KeyPoint]): KeyPoints from the second image.
+        matches  (List[cv2.DMatch])   : Initial matches between kp1 and kp2.
+        thresh   (float)              : RANSAC inlier threshold (pixels).
+
+    Returns:
+        List[cv2.DMatch]: Only those matches deemed inliers by RANSAC.
+    """
+    # Need at least 8 points for a fundamental matrix
+    if len(matches) < 8:
+        return matches
+
+    # Build corresponding point arrays
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+    # Run RANSAC to find inlier mask
+    F, mask = cv2.findFundamentalMat(
+        pts1, pts2,
+        method=cv2.FM_RANSAC,
+        ransacReprojThreshold=thresh,
+        confidence=0.99
+    )
+    mask = mask.ravel().astype(bool)
+
+    # Keep only the inlier matches
+    inliers = [m for m, ok in zip(matches, mask) if ok]
+    return inliers
 
 def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_tracks=1000):
     """
@@ -188,7 +216,6 @@ def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_track
         drawn+=1
     return vis
 
-# TODO REMOVE
 
 
 def main():
@@ -253,13 +280,7 @@ def main():
 
 
         # filter with RANSAC
-        if len(matches)>=8:
-            pts1_arr=np.float32([kp_map1[m.queryIdx].pt for m in matches])
-            pts2_arr=np.float32([kp_map2[m.trainIdx].pt for m in matches])
-            F,mask=cv2.findFundamentalMat(pts1_arr,pts2_arr,
-                                          cv2.FM_RANSAC,args.ransac_thresh,0.99)
-            mask=mask.ravel().astype(bool)
-            matches=[m for m,mk in zip(matches,mask) if mk]
+        matches = filter_matches_ransac(kp1, kp2, matches, args.ransac_thresh)
         
         # update & prune tracks
         frame_no = i + 1
