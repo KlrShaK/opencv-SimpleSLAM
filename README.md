@@ -4,7 +4,11 @@
 https://github.com/user-attachments/assets/f489a554-299e-41ad-a4b4-436e32d8cbd5
 
 
-
+## IMPORTANT - LightGlue Installation- 
+```
+git clone https://github.com/cvg/LightGlue.git && cd LightGlue
+python -m pip install -e .
+```
 
 ## Overview
 
