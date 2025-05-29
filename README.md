@@ -1,7 +1,13 @@
-```markdown
 # Structure From Motion (SfM) - README
 
+
+https://github.com/user-attachments/assets/f489a554-299e-41ad-a4b4-436e32d8cbd5
+
+
+
+
 ## Overview
+
 This repository contains two Python scripts that demonstrate basic Structure-from-Motion (SfM) pipelines:
 
 1. **sfm.py**  
@@ -125,7 +131,6 @@ python sfm_lightglue_aliked.py --dataset kitti --data_path ./Dataset/kitti --use
   - BFMatcher or FLANN for matching.  
   - Essential matrix / PnP for pose.  
   - Minimal keyframe selection logic.  
-  - Optional pose refinement using `least_squares`.
 
 - **sfm_lightglue_aliked.py**
   - ALIKED for learned keypoints + descriptors, LightGlue for matching.  
