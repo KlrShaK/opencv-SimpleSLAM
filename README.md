@@ -5,10 +5,19 @@ https://github.com/user-attachments/assets/f489a554-299e-41ad-a4b4-436e32d8cbd5
 
 
 ## IMPORTANT - LightGlue Installation- 
+- 1st do this
 ```
 git clone https://github.com/cvg/LightGlue.git && cd LightGlue
 python -m pip install -e .
 ```
+- 2nd download data
+  - https://rpg.ifi.uzh.ch/docs/teaching/2024/kitti05.zip
+
+  - put it in folder named 'Dataset'
+
+- 3rd
+  - intall ```requirements.txt```
+  - ```bash scripts/run_tracker_visualization.sh```
 
 ## Overview
 

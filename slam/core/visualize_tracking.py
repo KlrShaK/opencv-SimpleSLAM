@@ -288,7 +288,6 @@ def main():
         
         # draw
         vis= img2.copy()
-
         vis=draw_tracks(vis,tracks,i+1)
         for t,tid in prev_map.items():
             cv2.circle(vis,tuple(map(int, kp_map2[t].pt)),3,(0,255,0),-1)
