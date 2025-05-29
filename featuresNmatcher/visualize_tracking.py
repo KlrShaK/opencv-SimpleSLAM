@@ -94,52 +94,13 @@ def lightglue_match(img1, img2, extractor, matcher, min_conf=0.0):
         # Get matches and keypoints as numpy arrays.
         matches = matches_out['matches']  # shape (K,2)
         # keypoints returned by LightGlue are numpy arrays of (x,y)
-        keypoints0 = feats0['keypoints'][matches[..., 0]]
-        keypoints1 = feats1['keypoints'][matches[..., 1]]
+        keypoints0 = feats0['keypoints']
+        keypoints1 = feats1['keypoints']
         
         # Convert the keypoints and matches to OpenCV formats.
         opencv_kp0, opencv_kp1, opencv_matches = convert_lightglue_to_opencv(keypoints0, keypoints1, matches)
         
-        return opencv_kp0, opencv_kp1, opencv_matches, keypoints0, keypoints1
-
-# def lightglue_match(img1, img2, extractor, matcher, min_conf=0.0):
-#     """
-#     Run LightGlue matching between img1 and img2, returning OpenCV-style keypoints and DMatches.
-
-#     Args:
-#         img1, img2       : BGR images as NumPy arrays.
-#         extractor        : ALIKED extractor (e.g. ALIKED(...).eval()).
-#         matcher          : LightGlue matcher (e.g. LightGlue(...).eval()).
-#         min_conf (float) : Minimum confidence threshold [0.0–1.0] to keep a match.
-
-#     Returns:
-#         pts0, pts1, dm   : Two lists of cv2.KeyPoint and a list of cv2.DMatch.
-#     """
-#     # Feature extraction
-#     f0, f1 = extractor.extract(img1), extractor.extract(img2)
-
-#     # 2) LightGlue matching
-#     matches = matcher({'image0': f0, 'image1': f1})
-#     f0, f1, matches = rbd(f0), rbd(f1), rbd(matches)
-
-#     idx = matches['matches']                # shape (N,2), may contain -1
-#     scores0 = matches.get('matching_scores0', None)
-#     scores1 = matches.get('matching_scores1', None)
-
-#     # 3) Filter out invalid (-1) matches
-#     valid = (idx[:, 0] >= 0) & (idx[:, 1] >= 0)
-#     if scores0 is not None and scores1 is not None and min_conf > 0.0:
-#         valid &= (scores0 >= min_conf) & (scores1 >= min_conf)
-
-#     idx = idx[valid]
-
-#     # 4) Convert to OpenCV KeyPoints + DMatches
-#     kp0 = f0['keypoints'][idx[..., 0]]
-#     kp1 = f1['keypoints'][idx[..., 1]]
-
-#     pts0, pts1, dm = convert_lightglue_to_opencv(kp0, kp1, idx)
-#     return pts0, pts1, dm
-
+        return opencv_kp0, opencv_kp1, opencv_matches
 
 def feature_detect_and_match(img1,img2,detector,matcher):
     kp1,des1=detector.detectAndCompute(img1,None)
@@ -203,7 +164,7 @@ def update_and_prune_tracks(matches, prev_map, tracks, kp_curr, frame_idx, next_
     return curr_map, tracks, next_track_id
 
 
-def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_tracks=50):
+def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_tracks=1000):
     """
     Draw each track's path with color decaying from green (new) to red (old).
     Only draw up to max_tracks most recent tracks, and sample every sample_rate-th track.
@@ -282,25 +243,13 @@ def main():
         
         # match features
         if args.use_lightglue:
-            kp_map1, kp_map2, matches,_ ,_ =lightglue_match(img1,img2,extractor,matcher_lg)
-            # print("type(kp_map1), type(kp_map2), type(matches)")
-            # print(type(kp_map1), type(kp_map2), type(matches))
-            # print(kp_map1[:50], "\n\n\n",kp_map2[:50],"\n\n\n", matches[:50])
+            kp_map1, kp_map2, matches =lightglue_match(img1,img2,extractor,matcher_lg)
             vis= img2.copy()
             import random
             vis = cv2.drawMatches(img1, kp_map1, img2, kp_map2, random.sample(matches, 50), None,
                                   flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-            # for idx,(p0,p1) in enumerate(zip(pts1,pts2)):
-            #     if idx>=50: break
-            #     x0,y0 = p0.pt; x1,y1 = p1.pt
-            #     vis= img2.copy() if not args.use_lightglue else tensor_to_bgr(img2)
-            #     cv2.circle(vis, (int(x1),int(y1)), 4, (0,0,255), 2)
         else:
             kp_map1, kp_map2, matches=feature_detect_and_match(img1, img2, detector, matcher_cv)
-            # print("type(kp_map1), type(kp_map2), type(matches)")
-            # print(type(kp_map1), type(kp_map2), type(matches))
-            # print(kp_map1[:50], "\n\n\n",kp_map2[:50],"\n\n\n", matches[:50])
-
 
 
         # filter with RANSAC
