@@ -16,7 +16,7 @@ python3 slam/core/visualize_tracking.py \
 # # 2) (Alternative) Run with ALIKED + LightGlue:
 # # ==============================================
 # python3 slam/core/visualize_tracking.py \
-#   --dataset kitti \
+#   --dataset malaga \
 #   --base_dir ./Dataset \
 #   --use_lightglue \
 #   --fps 10 \
