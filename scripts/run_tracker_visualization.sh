@@ -5,7 +5,7 @@ set -e
 # 1) Run with OpenCV SIFT detector + BF matcher:
 # ==============================================
 python3 slam/core/visualize_tracking.py \
-  --dataset kitti \
+  --dataset malaga \
   --base_dir ./Dataset \
   --detector orb \
   --matcher bf \

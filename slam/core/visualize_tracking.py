@@ -244,7 +244,7 @@ def main():
     is_custom=False
     if args.dataset=='kitti': img_dir,pat=os.path.join(prefix,'05','image_0'),'*.png'
     elif args.dataset=='parking': img_dir,pat=os.path.join(prefix,'images'),'*.png'
-    elif args.dataset=='malaga': img_dir,pat=os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_1024x768_Images'),' *_left.jpg'
+    elif args.dataset=='malaga': img_dir,pat =os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_1024x768_Images'),'*_left.jpg'
     else:
         vid=os.path.join(prefix,'custom_compress.mp4')
         cap=cv2.VideoCapture(vid)
@@ -253,6 +253,8 @@ def main():
             ok,fr=cap.read()
             if not ok: break; seq.append(fr)
         cap.release(); is_custom=True
+
+    # load images    
     if not is_custom: seq=sorted(glob.glob(os.path.join(img_dir,pat)))
 
     # tracking data
