@@ -230,7 +230,6 @@ def main():
                         help='RANSAC threshold for fundamental matrix')
     args=parser.parse_args()
 
-    interval_ms=int(1000/args.fps) if args.fps>0 else 0
     # init modules once
     if args.use_lightglue:
         if not LIGHTGLUE_AVAILABLE: raise ImportError('LightGlue unavailable')
@@ -262,25 +261,24 @@ def main():
     cv2.resizeWindow('Feature Tracking',1200,600)
 
     total=len(seq)-1; prev_time=time.time(); achieved_fps=0.0
-    for i in tqdm(range(total),desc='Tracking'):
+    for i in range(total): # tqdm(range(total),desc='Tracking'):
         # load images
         if is_custom: img1,img2=seq[i],seq[i+1]
-        # elif args.use_lightglue: img1=load_image(seq[i]).cuda(); img2=load_image(seq[i+1]).cuda()
         else: img1=cv2.imread(seq[i]);img2=cv2.imread(seq[i+1])
-        
+
         # match features
         if args.use_lightglue:
             kp_map1, kp_map2, matches =lightglue_match(img1,img2,extractor,matcher_lg)
             vis= img2.copy()
-            import random
-            vis = cv2.drawMatches(img1, kp_map1, img2, kp_map2, random.sample(matches, 50), None,
-                                  flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+            # import random
+            # vis = cv2.drawMatches(img1, kp_map1, img2, kp_map2, random.sample(matches, 50), None,
+            #                       flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
         else:
             kp_map1, kp_map2, matches=feature_detect_and_match(img1, img2, detector, matcher_cv)
 
 
         # filter with RANSAC
-        matches = filter_matches_ransac(kp1, kp2, matches, args.ransac_thresh)
+        matches = filter_matches_ransac(kp_map1, kp_map2, matches, args.ransac_thresh)
         
         # update & prune tracks
         frame_no = i + 1
@@ -296,7 +294,8 @@ def main():
         cv2.putText(vis,text,(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,255),2)
 
         # show
-        key=cv2.waitKey(0)
+        interval_ms=int(1000/args.fps) if args.fps>0 else 0
+        key=cv2.waitKey(interval_ms)
         cv2.imshow('Feature Tracking',vis)
         # measure fps
         now=time.time();dt=now-prev_time
