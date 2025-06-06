@@ -32,7 +32,7 @@ def get_matcher(matcher_type, detector_type=None):
         return cv2.BFMatcher(norm, crossCheck=True)
     raise ValueError(f"Unsupported matcher: {matcher_type}")
 
-def feature_detect_and_match(img1,img2,detector,matcher):
+def opencv_detector_and_matcher(img1,img2,detector,matcher):
     kp1,des1=detector.detectAndCompute(img1,None)
     kp2,des2=detector.detectAndCompute(img2,None)
     if des1 is None or des2 is None:
@@ -216,6 +216,80 @@ def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_track
         drawn+=1
     return vis
 
+def dataloader(args):
+    """
+    Load the dataset and return the detector, matcher, and sequence of images.
+    """
+    # init modules once
+    if args.use_lightglue:
+        if not LIGHTGLUE_AVAILABLE: raise ImportError('LightGlue unavailable')
+        detector=ALIKED(max_num_keypoints=2048).eval().cuda()
+        matcher=LightGlue(features='aliked').eval().cuda()
+    else:
+        detector=get_detector(args.detector)
+        matcher=get_matcher(args.matcher,args.detector)
+
+    # load sequence
+    prefix=os.path.join(args.base_dir, args.dataset)
+    is_custom=False
+    if args.dataset=='kitti': img_dir,pat=os.path.join(prefix,'05','image_0'),'*.png'
+    elif args.dataset=='parking': img_dir,pat=os.path.join(prefix,'images'),'*.png'
+    elif args.dataset=='malaga': img_dir,pat =os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_1024x768_Images'),'*_left.jpg'
+    else:
+        vid=os.path.join(prefix,'custom_compress.mp4')
+        cap=cv2.VideoCapture(vid)
+        seq=[]
+        while True:
+            ok,fr=cap.read()
+            if not ok: break; seq.append(fr)
+        cap.release(); is_custom=True
+
+    # load images    
+    if not is_custom: seq=sorted(glob.glob(os.path.join(img_dir,pat)))
+
+    return detector, matcher, seq
+
+def load_frame_pair(args,seq, i):
+    """
+    Load a pair of consecutive frames from the sequence.
+    Args:
+        seq (list): List of image paths or frames.
+        i (int): Index of the current frame.
+    Returns:
+        img1 (numpy.ndarray): First image.
+        img2 (numpy.ndarray): Second image.
+    """
+    # load images
+    if args.dataset=='custom': 
+        img1, img2 = seq[i], seq[i+1]
+    else: 
+        img1 = cv2.imread(seq[i])
+        img2=cv2.imread(seq[i+1])
+
+    return img1, img2
+
+def detect_and_match(args, img1, img2, detector, matcher):
+    """
+    Load two consecutive images from the sequence and match features using the specified detector and matcher.
+    Args:
+        args (argparse.Namespace): Command line arguments.
+        img1 (numpy.ndarray): First image.
+        img2 (numpy.ndarray): Second image.
+        detector: Feature detector object.
+        matcher: Feature matcher object.
+    Returns:
+        kp_map1 (list): Keypoints from the first image.
+        kp_map2 (list): Keypoints from the second image.
+        matches (list): List of matched features.
+    """
+    # match features
+    if args.use_lightglue:
+        kp_map1, kp_map2, matches = lightglue_match(img1,img2,detector,matcher)
+    else:
+        kp_map1, kp_map2, matches = opencv_detector_and_matcher(img1, img2, detector, matcher)
+    
+    return kp_map1, kp_map2, matches
+
 def is_new_keyframe(frame_idx, matches_to_kf, n_kf_features, kp_curr, kp_kf, kf_max_disp,
                     kf_min_ratio, kf_cooldown, last_kf_idx):
     """Return True if current frame should become a new key-frame."""
@@ -257,32 +331,8 @@ def main():
 
     args=parser.parse_args()
 
-    # init modules once
-    if args.use_lightglue:
-        if not LIGHTGLUE_AVAILABLE: raise ImportError('LightGlue unavailable')
-        detector=ALIKED(max_num_keypoints=2048).eval().cuda()
-        matcher=LightGlue(features='aliked').eval().cuda()
-    else:
-        detector=get_detector(args.detector)
-        matcher=get_matcher(args.matcher,args.detector)
-
-    # load sequence
-    prefix=os.path.join(args.base_dir, args.dataset)
-    is_custom=False
-    if args.dataset=='kitti': img_dir,pat=os.path.join(prefix,'05','image_0'),'*.png'
-    elif args.dataset=='parking': img_dir,pat=os.path.join(prefix,'images'),'*.png'
-    elif args.dataset=='malaga': img_dir,pat =os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_1024x768_Images'),'*_left.jpg'
-    else:
-        vid=os.path.join(prefix,'custom_compress.mp4')
-        cap=cv2.VideoCapture(vid)
-        seq=[]
-        while True:
-            ok,fr=cap.read()
-            if not ok: break; seq.append(fr)
-        cap.release(); is_custom=True
-
-    # load images    
-    if not is_custom: seq=sorted(glob.glob(os.path.join(img_dir,pat)))
+    # initialize detector and matcher
+    detector, matcher, seq = dataloader(args)
 
     # tracking data
     track_id=0; prev_map={}; tracks={}
@@ -291,17 +341,11 @@ def main():
 
     total=len(seq)-1; prev_time=time.time(); achieved_fps=0.0
     for i in tqdm(range(total),desc='Tracking'):
-        # load images
-        if is_custom: img1,img2=seq[i],seq[i+1]
-        else: img1=cv2.imread(seq[i]);img2=cv2.imread(seq[i+1])
+        # load frame pair
+        img1, img2 = load_frame_pair(args, seq, i)
 
-        # match features
-        if args.use_lightglue:
-            kp_map1, kp_map2, matches = lightglue_match(img1,img2,detector,matcher)
-            vis= img2.copy()
-        else:
-            kp_map1, kp_map2, matches = feature_detect_and_match(img1, img2, detector, matcher)
-
+        # Detect and match features
+        kp_map1, kp_map2, matches = detect_and_match(args, img1, img2, detector, matcher)
 
         # filter with RANSAC
         matches = filter_matches_ransac(kp_map1, kp_map2, matches, args.ransac_thresh)
