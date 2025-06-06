@@ -216,6 +216,25 @@ def draw_tracks(vis, tracks, current_frame, max_age=10, sample_rate=5, max_track
         drawn+=1
     return vis
 
+def is_new_keyframe(frame_idx, matches_to_kf, n_kf_features, kp_curr, kp_kf, kf_max_disp,
+                    kf_min_ratio, kf_cooldown, last_kf_idx):
+    """Return True if current frame should become a new key-frame."""
+    if frame_idx - last_kf_idx < kf_cooldown:
+        return False                        # still in cool-down window
+
+    # --- 1) Relative overlap test ----------------------------------------
+    overlap_ratio = len(matches_to_kf) / float(n_kf_features)
+    if overlap_ratio < kf_min_ratio:
+        return True                         # we lost too many tracks
+
+    # --- 2) Parallax test (unchanged) ------------------------------------
+    disp = [
+        np.linalg.norm(
+            np.array(kp_curr[m.trainIdx].pt) -
+            np.array(kp_kf[m.queryIdx].pt)
+        ) for m in matches_to_kf
+    ]
+    return np.mean(disp) > kf_max_disp
 
 
 def main():
@@ -226,18 +245,26 @@ def main():
     parser.add_argument('--matcher',choices=['bf'],default='bf')
     parser.add_argument('--use_lightglue',action='store_true')
     parser.add_argument('--fps',type=float,default=10)
-    parser.add_argument('--ransac_thresh',type=float,default=1.0,
-                        help='RANSAC threshold for fundamental matrix')
+    # --- RANSAC related CLI flags -------------------------------------------
+    parser.add_argument('--ransac_thresh',type=float,default=1.0, help='RANSAC threshold for fundamental matrix')
+    # --- Key-frame related CLI flags -----------------------------------------
+    parser.add_argument('--kf_max_disp',  type=float, default=30,
+                        help='Min avg. pixel displacement wrt last keyframe')
+    parser.add_argument('--kf_min_ratio', type=float, default=0.5,
+                    help='Min surviving-match ratio wrt last keyframe')
+    parser.add_argument('--kf_cooldown', type=int, default=5,
+                        help='Frames to wait before next keyframe check')
+
     args=parser.parse_args()
 
     # init modules once
     if args.use_lightglue:
         if not LIGHTGLUE_AVAILABLE: raise ImportError('LightGlue unavailable')
-        extractor=ALIKED(max_num_keypoints=2048).eval().cuda()
-        matcher_lg=LightGlue(features='aliked').eval().cuda()
+        detector=ALIKED(max_num_keypoints=2048).eval().cuda()
+        matcher=LightGlue(features='aliked').eval().cuda()
     else:
         detector=get_detector(args.detector)
-        matcher_cv=get_matcher(args.matcher,args.detector)
+        matcher=get_matcher(args.matcher,args.detector)
 
     # load sequence
     prefix=os.path.join(args.base_dir, args.dataset)
@@ -263,20 +290,17 @@ def main():
     cv2.resizeWindow('Feature Tracking',1200,600)
 
     total=len(seq)-1; prev_time=time.time(); achieved_fps=0.0
-    for i in range(total): # tqdm(range(total),desc='Tracking'):
+    for i in tqdm(range(total),desc='Tracking'):
         # load images
         if is_custom: img1,img2=seq[i],seq[i+1]
         else: img1=cv2.imread(seq[i]);img2=cv2.imread(seq[i+1])
 
         # match features
         if args.use_lightglue:
-            kp_map1, kp_map2, matches =lightglue_match(img1,img2,extractor,matcher_lg)
+            kp_map1, kp_map2, matches = lightglue_match(img1,img2,detector,matcher)
             vis= img2.copy()
-            # import random
-            # vis = cv2.drawMatches(img1, kp_map1, img2, kp_map2, random.sample(matches, 50), None,
-            #                       flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
         else:
-            kp_map1, kp_map2, matches=feature_detect_and_match(img1, img2, detector, matcher_cv)
+            kp_map1, kp_map2, matches = feature_detect_and_match(img1, img2, detector, matcher)
 
 
         # filter with RANSAC
