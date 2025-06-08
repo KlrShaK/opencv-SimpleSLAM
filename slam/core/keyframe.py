@@ -4,7 +4,7 @@ import argparse
 import time
 from tqdm import tqdm
 from dataclasses import dataclass
-
+import lz4.frame
 import cv2
 import numpy as np
 
@@ -101,13 +101,13 @@ def lightglue_match(img1, img2, extractor, matcher, min_conf=0.0):
         matches_out = rbd(matches_out)
         
         # Get matches and keypoints as numpy arrays.
-        matches = matches_out['matches']  # shape (K,2)
+        matches = matches_out['matches']
         # keypoints returned by LightGlue are numpy arrays of (x,y)
         keypoints0 = feats0['keypoints']
         keypoints1 = feats1['keypoints']
-        descriptors0 = feats0['descriptors']  # shape (K,D)
-        descriptors1 = feats1['descriptors']  # shape (K,D)    
-        print("discriptor types:", type(descriptors0), type(descriptors1))
+        descriptors0 = feats0['descriptors']
+        descriptors1 = feats1['descriptors']  
+        # print("discriptor types:", type(descriptors0), type(descriptors1))
 
         
         # Convert the keypoints and matches to OpenCV formats.
@@ -230,8 +230,8 @@ def dataloader(args):
     """
     # init modules once
     if args.use_lightglue:
-        detector=ALIKED(max_num_keypoints=2048).eval().cuda()
-        matcher=LightGlue(features='aliked').eval().cuda()
+        detector= ALIKED(max_num_keypoints=2048).eval().cuda()
+        matcher= LightGlue(features='aliked').eval().cuda()
     else:
         detector=get_detector(args.detector)
         matcher=get_matcher(args.matcher,args.detector)
@@ -297,25 +297,73 @@ def detect_and_match(args, img1, img2, detector, matcher):
     
     return kp_map1, kp_map2, des1, des2, matches
 
-def is_new_keyframe(frame_idx, matches_to_kf, n_kf_features, kp_curr, kp_kf, kf_max_disp,
-                    kf_min_ratio, kf_cooldown, last_kf_idx):
-    """Return True if current frame should become a new key-frame."""
+def is_new_keyframe(frame_idx: int,
+                    matches_to_kf: list[cv2.DMatch],
+                    n_kf_features: int,
+                    kp_curr: list[cv2.KeyPoint],
+                    kp_kf: list[cv2.KeyPoint],
+                    kf_max_disp: float = 30.0,
+                    kf_min_inliers: int = 125,
+                    kf_cooldown: int = 5,
+                    last_kf_idx: int = -999) -> bool:
+    """
+    Decide whether the *current* frame should become a new key-frame.
+
+    Parameters
+    ----------
+    frame_idx      : index of the current frame in the sequence
+    matches_to_kf  : list of inlier cv2.DMatch between LAST KF and current frame
+    n_kf_features  : total number of keypoints that existed in the last KF
+    kp_curr        : keypoints detected in the current frame
+    kp_kf          : keypoints of the last key-frame
+    kf_max_disp    : pixel-space parallax threshold (avg. L2) to trigger a new KF
+    kf_min_inliers   : minimum *surviving-match* ratio; below → new KF
+    kf_cooldown    : minimum #frames to wait after last KF before creating another
+    last_kf_idx    : frame index of the most recent key-frame
+
+    Returns
+    -------
+    bool           : True ⇒ promote current frame to key-frame
+    """
+
+    # 0) Cool-down guard                                                 #
     if frame_idx - last_kf_idx < kf_cooldown:
-        return False                        # still in cool-down window
+        return False            # too soon to spawn another KF
 
-    # --- 1) Relative overlap test ----------------------------------------
-    overlap_ratio = len(matches_to_kf) / float(n_kf_features)
-    if overlap_ratio < kf_min_ratio:
-        return True                         # we lost too many tracks
+    # 1) Overlap / track-survival test                                   #
+    # If the key-frame had zero features (should never happen) → force new KF
+    if not matches_to_kf or not n_kf_features:       # no matches or features at all ⇒ we must create a new KF
+        return True
+    
+    if len(matches_to_kf) < kf_min_inliers:
+        return True            # too few matches survived, so we must create a new KF
+    
+    # OVERLAP RATIO TEST (not used anymore, see below) # This Logic is not working well, so we use a different metric 
+    # overlap_ratio = len(matches_to_kf) / float(n_kf_features)
+    # print(f"[KF] Overlap ratio: {overlap_ratio:.2f} (matches={len(matches_to_kf)})")
+    # if overlap_ratio < kf_min_ratio:
+    #     return True             
 
-    # --- 2) Parallax test (unchanged) ------------------------------------
+    # 2) Parallax test (average pixel displacement)                      #TODO replace with a more robust metric
+    # Compute mean Euclidean displacement between matched pairs
     disp = [
-        np.linalg.norm(
-            np.array(kp_curr[m.trainIdx].pt) -
-            np.array(kp_kf[m.queryIdx].pt)
-        ) for m in matches_to_kf
+        np.hypot(
+            kp_curr[m.trainIdx].pt[0] - kp_kf[m.queryIdx].pt[0],
+            kp_curr[m.trainIdx].pt[1] - kp_kf[m.queryIdx].pt[1]
+        )
+        for m in matches_to_kf
     ]
-    return np.mean(disp) > kf_max_disp
+
+    if np.mean(disp) > kf_max_disp:
+        return True
+    return False
+
+
+def make_thumb(bgr, hw=(854,480)):
+    """Return lz4-compressed JPEG thumbnail (bytes)."""
+    th = cv2.resize(bgr, hw)
+    ok, enc = cv2.imencode('.jpg', th, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    return lz4.frame.compress(enc.tobytes()) if ok else b''
 
 @dataclass
 class Keyframe:
@@ -337,13 +385,14 @@ def main():
     # --- RANSAC related CLI flags -------------------------------------------
     parser.add_argument('--ransac_thresh',type=float,default=1.0, help='RANSAC threshold for fundamental matrix')
     # --- Key-frame related CLI flags -----------------------------------------
-    parser.add_argument('--kf_max_disp',  type=float, default=30,
+    parser.add_argument('--kf_max_disp',  type=float, default=45,
                         help='Min avg. pixel displacement wrt last keyframe')
-    parser.add_argument('--kf_min_ratio', type=float, default=0.5,
-                    help='Min surviving-match ratio wrt last keyframe')
-    parser.add_argument('--kf_cooldown', type=int, default=5,
+    parser.add_argument('--kf_min_inliers', type=float, default=150,
+                    help='Min surviving-match features wrt last keyframe')
+    parser.add_argument('--kf_cooldown', type=int, default=3,
                         help='Frames to wait before next keyframe check')
-
+    parser.add_argument('--kf_thumb_hw',  type=int, nargs=2, default=[640,360],
+    help='Width Height of key-frame thumbnail')
     args=parser.parse_args()
 
     # initialize detector and matcher
@@ -369,11 +418,60 @@ def main():
         frame_no = i + 1
         prev_map, tracks, track_id = update_and_prune_tracks(matches, prev_map, tracks, kp_map2, frame_no, track_id, prune_age=30)
         
+        # ----------------------------------------------------------------------
+        # Key-frame subsystem (light-weight, zero full-image retention)
+        # ----------------------------------------------------------------------
+        if i == 0:                          # bootstrap KF0
+            thumb = make_thumb(img1, tuple(args.kf_thumb_hw))
+            kfs   = [Keyframe(0, seq[0] if isinstance(seq[0],str) else "",
+                            kp_map1, des1, thumb)]
+            last_kf_idx = 0
+        else:
+            # 1) match *stored* KF descriptors ↔ current frame descriptors
+            kf = kfs[-1]
+            kf_matches = matcher.match(kf.desc, des2) if len(des2) and len(kf.desc) else []
+            kf_matches = filter_matches_ransac(kf.kps, kp_map2, kf_matches, args.ransac_thresh)
+
+            # 2) decide
+            if is_new_keyframe(frame_no,
+                            kf_matches,
+                            n_kf_features=len(kf.kps),
+                            kp_curr=kp_map2,
+                            kp_kf=kf.kps,
+                            kf_max_disp=args.kf_max_disp,
+                            kf_min_inliers=args.kf_min_inliers,
+                            kf_cooldown=args.kf_cooldown,
+                            last_kf_idx=last_kf_idx):
+                thumb = make_thumb(img2, tuple(args.kf_thumb_hw))
+                kfs.append(Keyframe(frame_no,
+                                    seq[i+1] if isinstance(seq[i+1],str) else "",
+                                    kp_map2, des2, thumb))
+                last_kf_idx = frame_no
+                # print(f"[KF] {frame_no:4d}  total={len(kfs)}")
+
+
         # draw
         vis= img2.copy()
         vis=draw_tracks(vis,tracks,i+1)
         for t,tid in prev_map.items():
             cv2.circle(vis,tuple(map(int, kp_map2[t].pt)),3,(0,255,0),-1)
+
+
+        # --------------------------------------------------------
+        # overlay active KF id
+        cv2.putText(vis, f"KF index:{last_kf_idx} , len: {len(kfs)}", (10,60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+
+        # assemble strip
+        thumbs = [cv2.imdecode(np.frombuffer(lz4.frame.decompress(kf.thumb),np.uint8),
+                            cv2.IMREAD_COLOR) for kf in kfs[-4:]]
+        bar = np.hstack(thumbs) if thumbs else np.zeros((args.kf_thumb_hw[1],args.kf_thumb_hw[0],3), np.uint8)
+        cv2.imshow('Keyframes', bar)
+        
+        MAX_MEM_KF = 500
+        if len(kfs) > MAX_MEM_KF:
+            dump = kfs.pop(0)                # oldest KF
+        # --------------------------------------------------------
 
         text=f"Frame {i+1}/{total} | Tracks: {len(tracks)} | FPS: {achieved_fps:.1f}"
         cv2.putText(vis,text,(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,255),2)
