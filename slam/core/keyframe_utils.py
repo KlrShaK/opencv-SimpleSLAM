@@ -1,80 +1,79 @@
+# keyframe.py
 from dataclasses import dataclass
-import lz4.frame
 import cv2
 import numpy as np
+import lz4.frame
 
-
+# --------------------------------------------------------------------------- #
+#  Dataclass
+# --------------------------------------------------------------------------- #
 @dataclass
 class Keyframe:
-    idx: int                   # global frame index
-    path: str                  # on-disk image file  OR "" if custom video
-    kps:  list[cv2.KeyPoint]   # keypoints (needed for geometric checks)
-    desc: np.ndarray           # descriptors (uint8/float32)
-    thumb: bytes               # lz4-compressed thumbnail for UI
+    idx:   int                    # global frame index
+    path:  str                    # "" for in-memory frames
+    kps:   list[cv2.KeyPoint]
+    desc:  np.ndarray
+    thumb: bytes                  # lz4-compressed JPEG
 
-def is_new_keyframe(frame_idx: int,
-                    matches_to_kf: list[cv2.DMatch],
-                    n_kf_features: int,
-                    kp_curr: list[cv2.KeyPoint],
-                    kp_kf: list[cv2.KeyPoint],
-                    kf_max_disp: float = 30.0,
-                    kf_min_inliers: int = 125,
-                    kf_cooldown: int = 5,
-                    last_kf_idx: int = -999) -> bool:
-    """
-    Decide whether the *current* frame should become a new key-frame.
 
-    Parameters
-    ----------
-    frame_idx      : index of the current frame in the sequence
-    matches_to_kf  : list of inlier cv2.DMatch between LAST KF and current frame
-    n_kf_features  : total number of keypoints that existed in the last KF
-    kp_curr        : keypoints detected in the current frame
-    kp_kf          : keypoints of the last key-frame
-    kf_max_disp    : pixel-space parallax threshold (avg. L2) to trigger a new KF
-    kf_min_inliers   : minimum *surviving-match* ratio; below → new KF
-    kf_cooldown    : minimum #frames to wait after last KF before creating another
-    last_kf_idx    : frame index of the most recent key-frame
-
-    Returns
-    -------
-    bool           : True ⇒ promote current frame to key-frame
-    """
-
-    # 0) Cool-down guard                                                 #
-    if frame_idx - last_kf_idx < kf_cooldown:
-        return False            # too soon to spawn another KF
-
-    # 1) Overlap / track-survival test                                   #
-    # If the key-frame had zero features (should never happen) → force new KF
-    if not matches_to_kf or not n_kf_features:       # no matches or features at all ⇒ we must create a new KF
-        return True
-    
-    if len(matches_to_kf) < kf_min_inliers:
-        return True            # too few matches survived, so we must create a new KF
-    
-    # OVERLAP RATIO TEST (not used anymore, see below) # This Logic is not working well, so we use a different metric 
-    # overlap_ratio = len(matches_to_kf) / float(n_kf_features)
-    # print(f"[KF] Overlap ratio: {overlap_ratio:.2f} (matches={len(matches_to_kf)})")
-    # if overlap_ratio < kf_min_ratio:
-    #     return True             
-
-    # 2) Parallax test (average pixel displacement)                      #TODO replace with a more robust metric
-    # Compute mean Euclidean displacement between matched pairs
-    disp = [
-        np.hypot(
-            kp_curr[m.trainIdx].pt[0] - kp_kf[m.queryIdx].pt[0],
-            kp_curr[m.trainIdx].pt[1] - kp_kf[m.queryIdx].pt[1]
-        )
-        for m in matches_to_kf
-    ]
-
-    if np.mean(disp) > kf_max_disp:
-        return True
-    return False
-
-def make_thumb(bgr, hw=(854,480)):
-    """Return lz4-compressed JPEG thumbnail (bytes)."""
+# --------------------------------------------------------------------------- #
+#  Helpers
+# --------------------------------------------------------------------------- #
+def make_thumb(bgr, hw=(640, 360)):
     th = cv2.resize(bgr, hw)
-    ok, enc = cv2.imencode('.jpg', th, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    ok, enc = cv2.imencode('.jpg', th,
+                           [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return lz4.frame.compress(enc.tobytes()) if ok else b''
+
+
+def is_new_keyframe(frame_idx,
+                    matches_to_kf,
+                    n_kf_features,
+                    kp_curr,
+                    kp_kf,
+                    kf_max_disp=30.0,
+                    kf_min_inliers=125,
+                    kf_cooldown=5,
+                    last_kf_idx=-999):
+    """
+    Decide whether current frame should be promoted to a Keyframe.
+    """
+    if frame_idx - last_kf_idx < kf_cooldown:
+        return False
+    if not matches_to_kf or not n_kf_features:
+        return True
+    if len(matches_to_kf) < kf_min_inliers:
+        return True
+
+    disp = [np.hypot(kp_curr[m.trainIdx].pt[0] - kp_kf[m.queryIdx].pt[0],
+                     kp_curr[m.trainIdx].pt[1] - kp_kf[m.queryIdx].pt[1])
+            for m in matches_to_kf]
+    return np.mean(disp) > kf_max_disp
+
+
+# --------------------------------------------------------------------------- #
+#  Track maintenance
+# --------------------------------------------------------------------------- #
+def update_and_prune_tracks(matches, prev_map, tracks,
+                            kp_curr, frame_idx, next_track_id,
+                            prune_age=30):
+    """
+    Continuation of simple 2-D point tracks across frames.
+    """
+    curr_map = {}
+
+    for m in matches:
+        q, t = m.queryIdx, m.trainIdx
+        x, y = map(int, kp_curr[t].pt)
+        tid   = prev_map.get(q, next_track_id)
+        if tid == next_track_id:
+            tracks[tid] = []
+            next_track_id += 1
+        curr_map[t] = tid
+        tracks[tid].append((frame_idx, x, y))
+
+    # prune dead tracks
+    for tid, pts in list(tracks.items()):
+        if frame_idx - pts[-1][0] > prune_age:
+            del tracks[tid]
+    return curr_map, tracks, next_track_id
