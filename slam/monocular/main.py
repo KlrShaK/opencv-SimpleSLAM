@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-from slam.core.dataloader import load_sequence, load_frame_pair
+from slam.core.dataloader import load_sequence, load_frame_pair, load_calibration, load_groundtruth
 from slam.core.features_utils import (init_feature_pipeline, feature_extractor, feature_matcher, filter_matches_ransac)
 from slam.core.keyframe_utils import (Keyframe, update_and_prune_tracks, select_keyframe, make_thumb)
 from slam.core.visualization_utils import draw_tracks
@@ -50,6 +50,9 @@ def main():
     args = _build_parser().parse_args()
 
     seq = load_sequence(args)
+    calib       = load_calibration(args)        # dict with K_l, P_l, ...
+    groundtruth = load_groundtruth(args)        # None or Nx3x4 array
+
     detector, matcher = init_feature_pipeline(args)
 
     # tracking state
