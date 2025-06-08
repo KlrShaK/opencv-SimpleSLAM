@@ -5,7 +5,7 @@ set -e
 # 1) Run with OpenCV SIFT detector + BF matcher:
 # ==============================================
 python3 slam/core/keyframe.py \
-  --dataset kitti \
+  --dataset tum-rgbd \
   --base_dir ./Dataset \
   --detector akaze \
   --matcher bf \

@@ -241,7 +241,8 @@ def dataloader(args):
     is_custom=False
     if args.dataset=='kitti': img_dir,pat=os.path.join(prefix,'05','image_0'),'*.png'
     elif args.dataset=='parking': img_dir,pat=os.path.join(prefix,'images'),'*.png'
-    elif args.dataset=='malaga': img_dir,pat =os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_1024x768_Images'),'*_left.jpg'
+    elif args.dataset=='malaga': img_dir,pat =os.path.join(prefix,'malaga-urban-dataset-extract-07_rectified_800x600_Images'),'*_left.jpg'
+    elif args.dataset=='tum-rgbd': img_dir,pat =os.path.join(prefix,'rgbd_dataset_freiburg1_room', 'rgb'),'*.png'
     else:
         vid=os.path.join(prefix,'custom_compress.mp4')
         cap=cv2.VideoCapture(vid)
@@ -328,7 +329,7 @@ class Keyframe:
 
 def main():
     parser=argparse.ArgumentParser("Feature tracking with RANSAC filtering")
-    parser.add_argument('--dataset',choices=['kitti','malaga','parking','custom'],required=True)
+    parser.add_argument('--dataset',choices=['kitti','malaga','tum-rgb','custom'],required=True)
     parser.add_argument('--base_dir',default='.././Dataset')
     parser.add_argument('--detector',choices=['orb','sift','akaze'],default='orb')
     parser.add_argument('--matcher',choices=['bf'],default='bf')
