@@ -1,4 +1,4 @@
-# featuresExtractNmatch.py
+# features_utils.py
 import cv2
 import numpy as np
 from typing import List, Tuple
@@ -49,7 +49,7 @@ def _get_opencv_matcher(matcher_type, detector_type):
 #  Individual feature extraction and matching functions
 # --------------------------------------------------------------------------- #
 
-def _convert_lg_kps_to_opencv(kp0):
+def _convert_lg_kps_to_opencv(kp0: torch.Tensor) -> List[cv2.KeyPoint]:
     cv_kp0 = [cv2.KeyPoint(float(x), float(y), 1) for x, y in kp0]
     return cv_kp0
 
@@ -100,12 +100,12 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
     """
     Match features between two FrameFeatures and return OpenCV-compatible matches.
     """
+    # TODO: add min_conf filtering
     if args.use_lightglue:
         # LightGlue matching
         # kp0, kp1: List[cv2.KeyPoint]
         # des0, des1: torch.Tensor [M×D], [N×D]
         device = des0.device
-        print(device)
         lg_kp0 = _convert_opencv_to_lg_kps(kp0).to(device).unsqueeze(0)   # [1×M×2]
         lg_kp1 = _convert_opencv_to_lg_kps(kp1).to(device).unsqueeze(0)   # [1×N×2]
         lg_desc0 = des0.unsqueeze(0)                          # [1×M×D]

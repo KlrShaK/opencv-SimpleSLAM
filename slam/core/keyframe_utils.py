@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import lz4.frame
+from typing import List, Tuple
+from slam.core.features_utils import feature_matcher, filter_matches_ransac
 
 # --------------------------------------------------------------------------- #
 #  Dataclass
@@ -25,10 +27,8 @@ def make_thumb(bgr, hw=(640, 360)):
                            [int(cv2.IMWRITE_JPEG_QUALITY), 70])
     return lz4.frame.compress(enc.tobytes()) if ok else b''
 
-
 def is_new_keyframe(frame_idx,
                     matches_to_kf,
-                    n_kf_features,
                     kp_curr,
                     kp_kf,
                     kf_max_disp=30.0,
@@ -40,7 +40,7 @@ def is_new_keyframe(frame_idx,
     """
     if frame_idx - last_kf_idx < kf_cooldown:
         return False
-    if not matches_to_kf or not n_kf_features:
+    if not matches_to_kf:
         return True
     if len(matches_to_kf) < kf_min_inliers:
         return True
@@ -50,6 +50,66 @@ def is_new_keyframe(frame_idx,
             for m in matches_to_kf]
     return np.mean(disp) > kf_max_disp
 
+def select_keyframe(
+    args,
+    seq: List[str],
+    frame_idx: int,
+    img2, kp2, des2,
+    matcher,
+    kfs: List[Keyframe],
+    last_kf_idx: int
+) -> Tuple[List[Keyframe], int]:
+    """
+    Decide whether to add a new Keyframe at this iteration.
+
+    Parameters
+    ----------
+    args
+        CLI namespace (provides use_lightglue, ransac_thresh, kf_* params).
+    seq
+        Original sequence list (so we can grab file paths if needed).
+    frame_idx
+        Zero-based index of the *first* of the pair.  Keyframes use i+1 as frame number.
+    img1, img2
+        BGR images for frames i, i+1 (for thumbnail if we promote).
+    kp1, des1
+        KPs/descriptors of frame i.
+    kp2, des2
+        KPs/descriptors of frame i+1.
+    matcher
+        Either the OpenCV BF/FLANN matcher or the LightGlue matcher.
+    kfs
+        Current list of Keyframe objects.
+    last_kf_idx
+        Frame number (1-based) of the last keyframe added; or -inf if none.
+
+    Returns
+    -------
+    kfs
+        Possibly-extended list of Keyframe objects.
+    last_kf_idx
+        Updated last keyframe index (still the same if we didn’t add one).
+    """
+    frame_no = frame_idx + 1
+    prev_kf = kfs[-1]
+    # 1) match descriptors from the old KF to the new frame
+    raw_matches = feature_matcher(
+        args, prev_kf.kps, kp2, prev_kf.desc, des2, matcher
+    )
+    # 2) drop outliers
+    matches = filter_matches_ransac(
+        prev_kf.kps, kp2, raw_matches, args.ransac_thresh
+    )
+
+    # 3) promotion test
+    if is_new_keyframe(frame_no, matches, kp2, prev_kf.kps, args.kf_max_disp, args.kf_min_inliers,
+                       args.kf_cooldown, last_kf_idx):
+        thumb = make_thumb(img2, tuple(args.kf_thumb_hw))
+        path  = seq[frame_idx + 1] if isinstance(seq[frame_idx + 1], str) else ""
+        kfs.append(Keyframe(frame_no, path, kp2, des2, thumb))
+        last_kf_idx = frame_no
+
+    return kfs, last_kf_idx
 
 # --------------------------------------------------------------------------- #
 #  Track maintenance
