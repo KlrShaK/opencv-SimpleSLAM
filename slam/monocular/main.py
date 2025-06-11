@@ -69,6 +69,8 @@ def main():
     cv2.resizeWindow('Feature Tracking', 1200, 600)
 
     total = len(seq) - 1
+    PAUSED = False
+
     for i in tqdm(range(total), desc='Tracking'):
         # load image pair
         img1, img2 = load_frame_pair(args, seq, i)
@@ -120,8 +122,12 @@ def main():
 
         cv2.imshow('Feature Tracking', vis)
         wait_ms = int(1000 / args.fps) if args.fps > 0 else 1
-        if cv2.waitKey(wait_ms) & 0xFF == 27:    # ESC
+        key = cv2.waitKey(0 if PAUSED else wait_ms) & 0xFF
+        if key == 27:  # ESC to exit
             break
+        elif key == ord('p'):  # 'p' to toggle pause
+            PAUSED = not PAUSED
+            continue
 
         # update FPS
         now = cv2.getTickCount() / cv2.getTickFrequency()
