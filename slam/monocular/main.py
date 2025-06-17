@@ -3,6 +3,18 @@
 Entry-point: high-level processing loop
 --------------------------------------
 $ python main.py --dataset kitti --base_dir ../Dataset
+
+
+The core loop now performs:
+  1) Feature detection + matching (OpenCV or LightGlue)
+  2) Essential‑matrix estimation + pose recovery
+  3) Landmarks triangulation (with Z‑filtering)
+  4) Pose integration (camera trajectory in world frame)
+  5) Optional 3‑D visualisation via Open3D 
+
+The script shares most command‑line arguments with the previous version
+but adds `--no_viz3d` to disable the 3‑D window.
+
 """
 import argparse
 import cv2
@@ -11,10 +23,27 @@ import numpy as np
 from tqdm import tqdm
 
 
-from slam.core.dataloader import load_sequence, load_frame_pair, load_calibration, load_groundtruth
-from slam.core.features_utils import (init_feature_pipeline, feature_extractor, feature_matcher, filter_matches_ransac)
-from slam.core.keyframe_utils import (Keyframe, update_and_prune_tracks, select_keyframe, make_thumb)
-from slam.core.visualization_utils import draw_tracks
+from slam.core.dataloader import (
+                            load_sequence, 
+                            load_frame_pair, 
+                            load_calibration, 
+                            load_groundtruth)
+
+from slam.core.features_utils import (
+                                init_feature_pipeline, 
+                                feature_extractor, 
+                                feature_matcher, 
+                                filter_matches_ransac)
+
+from slam.core.keyframe_utils import (
+    Keyframe, 
+    update_and_prune_tracks, 
+    select_keyframe, 
+    make_thumb)
+
+from slam.core.visualization_utils import draw_tracks, Visualizer3D
+from slam.core.landmark_utils import Map, triangulate_points
+
 
 # --------------------------------------------------------------------------- #
 #  CLI
@@ -40,50 +69,120 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--kf_cooldown', type=int, default=3)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2,
                    default=[640, 360])
+    
+    # 3‑D visualisation toggle
+    p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D matplotlib window")
+    # triangulation depth filtering
+    p.add_argument("--min_depth", type=float, default=0.1)
+    p.add_argument("--max_depth", type=float, default=30.0)
+
     return p
+
+
+# --------------------------------------------------------------------------- #
+#  Helper functions
+# --------------------------------------------------------------------------- #
+
+def _pose_inv(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Return 4×4 inverse of a rigid‑body transform specified by R|t."""
+    Rt = R.T
+    tinv = -Rt @ t
+    T = np.eye(4)
+    T[:3, :3] = Rt
+    T[:3, 3] = tinv.ravel()
+    return T
 
 
 # --------------------------------------------------------------------------- #
 #  Main processing loop
 # --------------------------------------------------------------------------- #
 def main():
+    PAUSED = False
     args = _build_parser().parse_args()
 
+    # --- Data loading ---
     seq = load_sequence(args)
     calib       = load_calibration(args)        # dict with K_l, P_l, ...
     groundtruth = load_groundtruth(args)        # None or Nx3x4 array
+    K = calib["K_l"]  # intrinsic matrix for left camera
+    P = calib["P_l"]  # projection matrix for left camera
 
+    # --- feature pipeline (OpenCV / LightGlue) ---
     detector, matcher = init_feature_pipeline(args)
 
-    # tracking state
+    # --- tracking state ---
     prev_map, tracks = {}, {}
     next_track_id = 0
+
+    world_map = Map()
+    cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
+    world_map.add_pose(cur_pose)
+    viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
+
+    kfs: list[Keyframe] = []
+    last_kf_idx = -999
+
+    # --- visualisation ---
     achieved_fps = 0.0
     last_time = cv2.getTickCount() / cv2.getTickFrequency()
 
-    # key-frame list
-    kfs: list[Keyframe] = []
-    last_kf_idx = -999        # sentinel
-
-    cv2.namedWindow('Feature Tracking', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Feature Tracking', 1200, 600)
+    # cv2.namedWindow('Feature Tracking', cv2.WINDOW_NORMAL)
+    # cv2.resizeWindow('Feature Tracking', 1200, 600)
 
     total = len(seq) - 1
-    PAUSED = False
 
     for i in tqdm(range(total), desc='Tracking'):
-        # load image pair
+        # --- load image pair ---
         img1, img2 = load_frame_pair(args, seq, i)
 
-        # feature extraction / matching
+        # --- feature extraction / matching ---
         kp1, des1 = feature_extractor(args, img1, detector)
         kp2, des2 = feature_extractor(args, img2, detector)
         matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
-
-        # filter matches with RANSAC
+        # --- filter matches with RANSAC ---
         matches = filter_matches_ransac(kp1, kp2, matches, args.ransac_thresh)
 
-        # track maintenance
+        if len(matches) < 12:
+            print(f"[WARN] Not enough matches at frame {i}. Skipping.")
+            continue
+
+        # --- Relative pose from Essential matrix ---
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+
+        E, mask_E = cv2.findEssentialMat(
+            pts1,
+            pts2,
+            K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=args.ransac_thresh,
+        )
+        if E is None or E.shape != (3, 3):
+            print(f"[WARN] Essential matrix failed at frame {i}.")
+            continue
+
+        _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K)
+        mask = (mask_E.ravel() & mask_pose.ravel()).astype(bool)
+        pts1_in, pts2_in = pts1[mask], pts2[mask]
+
+
+        # --- Triangulate new landmarks (in camera‑1 frame) ---
+        pts3d_cam = triangulate_points(K, R, t, pts1_in, pts2_in)
+        z = pts3d_cam[:, 2]
+        depth_mask = (z > args.min_depth) & (z < args.max_depth)
+        pts3d_cam = pts3d_cam[depth_mask]
+
+        # transform to world frame
+        pts3d_world = (cur_pose @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T).T[:, :3]
+        new_ids = world_map.add_points(pts3d_world)
+
+        # --- Update global pose ---
+        cur_pose = cur_pose @ _pose_inv(R, t)
+        world_map.add_pose(cur_pose)
+
+
+        # --- 2-D track maintenance (for GUI only) ---
         frame_no = i + 1
         prev_map, tracks, next_track_id = update_and_prune_tracks(matches, prev_map, tracks, kp2, frame_no, next_track_id)
 
@@ -96,45 +195,56 @@ def main():
         else:
             kfs, last_kf_idx = select_keyframe(args, seq, i, img2, kp2, des2, matcher, kfs, last_kf_idx)
 
-        # ---------------------- GUI -------------------------- #
-        vis = draw_tracks(img2.copy(), tracks, frame_no)
-        for t in prev_map.keys():
-            cv2.circle(vis, tuple(map(int, kp2[t].pt)), 3, (0, 255, 0), -1)
+        # --- 3-D visualisation ---
+        if viz3d is not None:
+            viz3d.update(world_map, new_ids)
 
-        cv2.putText(vis, f"KF idx: {last_kf_idx}  |  total KFs: {len(kfs)}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                    (255, 255, 0), 2)
+        # # ---------------------- GUI -------------------------- #
+        # vis = draw_tracks(img2.copy(), tracks, frame_no)
+        # for t in prev_map.keys():
+        #     cv2.circle(vis, tuple(map(int, kp2[t].pt)), 3, (0, 255, 0), -1)
 
-        # thumb strip (last 4)
-        thumbs = [cv2.imdecode(
-                  np.frombuffer(lz4.frame.decompress(k.thumb), np.uint8),
-                  cv2.IMREAD_COLOR) for k in kfs[-4:]]
-        bar = (np.hstack(thumbs) if thumbs else
-               np.zeros((*args.kf_thumb_hw[::-1], 3), np.uint8))
-        cv2.imshow('Keyframes', bar)
+        # cv2.putText(vis, f"KF idx: {last_kf_idx}  |  total KFs: {len(kfs)}",
+        #             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1,
+        #             (255, 255, 0), 2)
 
-        cv2.putText(vis,
-                    (f"Frame {frame_no}/{total} | "
-                     f"Tracks: {len(tracks)} | "
-                     f"FPS: {achieved_fps:.1f}"),
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                    (255, 255, 255), 2)
+        # # thumb strip (last 4)
+        # thumbs = [cv2.imdecode(
+        #           np.frombuffer(lz4.frame.decompress(k.thumb), np.uint8),
+        #           cv2.IMREAD_COLOR) for k in kfs[-4:]]
+        # bar = (np.hstack(thumbs) if thumbs else
+        #        np.zeros((*args.kf_thumb_hw[::-1], 3), np.uint8))
+        # cv2.imshow('Keyframes', bar)
 
-        cv2.imshow('Feature Tracking', vis)
-        wait_ms = int(1000 / args.fps) if args.fps > 0 else 1
-        key = cv2.waitKey(0 if PAUSED else wait_ms) & 0xFF
-        if key == 27:  # ESC to exit
-            break
-        elif key == ord('p'):  # 'p' to toggle pause
-            PAUSED = not PAUSED
-            continue
+        # cv2.putText(vis,
+        #             (f"Frame {frame_no}/{total} | "
+        #              f"Tracks: {len(tracks)} | "
+        #              f"FPS: {achieved_fps:.1f}"),
+        #             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
+        #             (255, 255, 255), 2)
+
+        # cv2.imshow('Feature Tracking', vis)
+        # wait_ms = int(1000 / args.fps) if args.fps > 0 else 1
+        # key = cv2.waitKey(0 if PAUSED else wait_ms) & 0xFF
+        # if key == 27:  # ESC to exit
+        #     break
+        # elif key == ord('p'):  # 'p' to toggle pause
+        #     PAUSED = not PAUSED
+        #     continue
 
         # update FPS
-        now = cv2.getTickCount() / cv2.getTickFrequency()
-        achieved_fps = 1.0 / (now - last_time)
-        last_time = now
+        # now = cv2.getTickCount() / cv2.getTickFrequency()
+        # achieved_fps = 1.0 / (now - last_time)
+        # last_time = now
 
     cv2.destroyAllWindows()
+
+    # keep 3‑D window alive after finishing
+    if viz3d is not None:
+        import matplotlib.pyplot as plt
+
+        plt.ioff()
+        plt.show()
 
 
 if __name__ == '__main__':
