@@ -168,6 +168,8 @@ def load_groundtruth(args) -> Optional[np.ndarray]:
         )
         return _malaga_get_gt(filepath, seq)
 
+    else:
+        pass
     # TODO: add TUM RGB-D parsing here
 
     return None
