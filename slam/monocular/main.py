@@ -199,7 +199,7 @@ def main():
         if viz3d is not None:
             viz3d.update(world_map, new_ids)
 
-        # # ---------------------- GUI -------------------------- #
+        # # ---------------------- GUI FOR 2D feature Tracking -------------------------- #
         # vis = draw_tracks(img2.copy(), tracks, frame_no)
         # for t in prev_map.keys():
         #     cv2.circle(vis, tuple(map(int, kp2[t].pt)), 3, (0, 255, 0), -1)
@@ -238,13 +238,6 @@ def main():
         # last_time = now
 
     cv2.destroyAllWindows()
-
-    # keep 3‑D window alive after finishing
-    if viz3d is not None:
-        import matplotlib.pyplot as plt
-
-        plt.ioff()
-        plt.show()
 
 
 if __name__ == '__main__':
