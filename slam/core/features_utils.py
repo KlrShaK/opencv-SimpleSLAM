@@ -21,8 +21,9 @@ def init_feature_pipeline(args):
     Returns (detector, matcher)
     """
     if args.use_lightglue:
-        detector = ALIKED(max_num_keypoints=2048).eval().cuda()
-        matcher  = LightGlue(features='aliked').eval().cuda()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        detector = ALIKED(max_num_keypoints=2048).eval().to(device)
+        matcher  = LightGlue(features='aliked').eval().to(device)
     else:
         detector = _get_opencv_detector(args.detector)
         matcher  = _get_opencv_matcher(args.matcher, args.detector)
