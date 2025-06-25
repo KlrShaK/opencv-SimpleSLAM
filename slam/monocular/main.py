@@ -41,7 +41,8 @@ from slam.core.keyframe_utils import (
     select_keyframe, 
     make_thumb)
 
-from slam.core.visualization_utils import draw_tracks, Visualizer3D
+from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
+from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map, triangulate_points
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
 
@@ -120,6 +121,14 @@ def main():
     K = calib["K_l"]  # intrinsic matrix for left camera
     P = calib["P_l"]  # projection matrix for left camera
 
+    # ------ build 4×4 GT poses + alignment matrix (once) ----------------
+    gt_T = None
+    R_align = t_align = None
+    if groundtruth is not None:
+        gt_T = np.pad(groundtruth, ((0, 0), (0, 1), (0, 0)), constant_values=0.0)
+        gt_T[:, 3, 3] = 1.0                             # homogeneous 1s
+        R_align, t_align = compute_gt_alignment(gt_T)
+
     # --- feature pipeline (OpenCV / LightGlue) ---
     detector, matcher = init_feature_pipeline(args)
 
@@ -131,6 +140,7 @@ def main():
     cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
     world_map.add_pose(cur_pose)
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
+    plot2d = TrajectoryPlotter()           
 
     kfs: list[Keyframe] = []
     last_kf_idx = -999
@@ -248,30 +258,36 @@ def main():
                             cols.append((255, 255, 255))  # white fallback
                     cols = np.float32(cols) / 255.0        # → 0-1
 
+                    # coarse rigid alignment of the *new* cloud to the map
+                    pts3d_world = world_map.align_points_to_map(pts3d_world, radius=args.merge_radius * 2.0)  # TODO: HYPER PARAMETER CHECK -MAGIC VARIABLE- radius can be loose here
                     new_ids = world_map.add_points(pts3d_world, cols)
-
                     frame_no = i + 1
                     for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
                         world_map.points[pid].add_observation(frame_no, m.trainIdx)
 
             if i % 10 == 0:
-                pts3d_world = world_map.align_points_to_map(pts3d_world, args.merge_radius) #TODO: merge close points
+                world_map.fuse_closeby_duplicate_landmarks(args.merge_radius)
 
-            # no keyframe → pure VO integration
-            cur_pose = pose_pred
 
         world_map.add_pose(cur_pose)
 
+        # --- 2-D path plot (cheap) ----------------------------------------------
+        est_pos = cur_pose[:3, 3]
+        gt_pos  = None
+        if gt_T is not None and i + 1 < len(gt_T):
+            p_gt = gt_T[i + 1, :3, 3]                     # raw GT
+            gt_pos = apply_alignment(p_gt, R_align, t_align)
+        plot2d.append(est_pos, gt_pos)
 
-        # --- 2-D track maintenance (for GUI only) ---
-        frame_no = i + 1
-        prev_map, tracks, next_track_id = update_and_prune_tracks(
-            matches, prev_map, tracks, kp2, frame_no, next_track_id)
+
+        # # --- 2-D track maintenance (for GUI only) ---
+        # frame_no = i + 1
+        # prev_map, tracks, next_track_id = update_and_prune_tracks(
+        #     matches, prev_map, tracks, kp2, frame_no, next_track_id)
 
 
         # --- 3-D visualisation ---
-        if viz3d is not None and i % 3 == 0:
-            viz3d.update(world_map, new_ids)
+        viz3d.update(world_map, new_ids)
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:

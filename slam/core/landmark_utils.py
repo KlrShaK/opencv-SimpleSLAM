@@ -82,7 +82,7 @@ class Map:
     def __len__(self) -> int:
         return len(self.points)
     
-    def merge_close(self, radius: float = 0.05) -> None:
+    def fuse_closeby_duplicate_landmarks(self, radius: float = 0.05) -> None:
         """Average-merge landmarks whose centres are closer than ``radius``."""
 
         if len(self.points) < 2:

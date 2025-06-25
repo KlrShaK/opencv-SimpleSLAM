@@ -41,53 +41,6 @@ import numpy as np
 ColourAxis = Literal["x", "y", "z", "auto"]
 
 # --------------------------------------------------------------------------- #
-#  2‑D overlay helpers
-# --------------------------------------------------------------------------- #
-
-def draw_tracks(
-    vis: np.ndarray,
-    tracks: Dict[int, List[Tuple[int, int, int]]],
-    current_frame: int,
-    max_age: int = 10,
-    sample_rate: int = 5,
-    max_tracks: int = 100,
-) -> np.ndarray:
-    """Draw ageing feature tracks as fading polylines.
-
-    Parameters
-    ----------
-    vis          : BGR uint8 image (modified *in‑place*)
-    tracks       : {track_id: [(frame_idx,x,y), ...]}
-    current_frame: index of the frame being drawn
-    max_age      : only show segments younger than this (#frames)
-    sample_rate  : skip tracks where `track_id % sample_rate != 0` to avoid clutter
-    max_tracks   : cap total rendered tracks for speed
-    """
-    recent = [
-        (tid, pts)
-        for tid, pts in tracks.items()
-        if current_frame - pts[-1][0] <= max_age
-    ]
-    recent.sort(key=lambda x: x[1][-1][0], reverse=True)
-
-    drawn = 0
-    for tid, pts in recent:
-        if drawn >= max_tracks:
-            break
-        if tid % sample_rate:
-            continue
-        pts = [p for p in pts if current_frame - p[0] <= max_age]
-        for j in range(1, len(pts)):
-            _, x0, y0 = pts[j - 1]
-            _, x1, y1 = pts[j]
-            ratio = (current_frame - pts[j - 1][0]) / max_age
-            colour = (0, int(255 * (1 - ratio)), int(255 * ratio))
-            cv2.line(vis, (x0, y0), (x1, y1), colour, 2)
-        drawn += 1
-    return vis
-
-
-# --------------------------------------------------------------------------- #
 #  3‑D visualiser  (Open3D only)                                             #
 # --------------------------------------------------------------------------- #
 
@@ -263,4 +216,98 @@ class Visualizer3D:
             self._closed = True
 
 
-__all__ = ["draw_tracks", "Visualizer3D"]
+# --------------------------------------------------------------------------- #
+#  2‑D overlay helpers
+# --------------------------------------------------------------------------- #
+
+def draw_tracks(
+    vis: np.ndarray,
+    tracks: Dict[int, List[Tuple[int, int, int]]],
+    current_frame: int,
+    max_age: int = 10,
+    sample_rate: int = 5,
+    max_tracks: int = 100,
+) -> np.ndarray:
+    """Draw ageing feature tracks as fading polylines.
+
+    Parameters
+    ----------
+    vis          : BGR uint8 image (modified *in‑place*)
+    tracks       : {track_id: [(frame_idx,x,y), ...]}
+    current_frame: index of the frame being drawn
+    max_age      : only show segments younger than this (#frames)
+    sample_rate  : skip tracks where `track_id % sample_rate != 0` to avoid clutter
+    max_tracks   : cap total rendered tracks for speed
+    """
+    recent = [
+        (tid, pts)
+        for tid, pts in tracks.items()
+        if current_frame - pts[-1][0] <= max_age
+    ]
+    recent.sort(key=lambda x: x[1][-1][0], reverse=True)
+
+    drawn = 0
+    for tid, pts in recent:
+        if drawn >= max_tracks:
+            break
+        if tid % sample_rate:
+            continue
+        pts = [p for p in pts if current_frame - p[0] <= max_age]
+        for j in range(1, len(pts)):
+            _, x0, y0 = pts[j - 1]
+            _, x1, y1 = pts[j]
+            ratio = (current_frame - pts[j - 1][0]) / max_age
+            colour = (0, int(255 * (1 - ratio)), int(255 * ratio))
+            cv2.line(vis, (x0, y0), (x1, y1), colour, 2)
+        drawn += 1
+    return vis
+
+
+# --------------------------------------------------------------------------- #
+#  Lightweight 2-D trajectory plotter (Matplotlib)
+# --------------------------------------------------------------------------- #
+import matplotlib.pyplot as plt
+
+class TrajectoryPlotter:
+    """Interactive Matplotlib window showing estimate (blue) and GT (red)."""
+
+    def __init__(self, figsize: Tuple[int, int] = (5, 5)) -> None:
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=figsize)
+        self.ax.set_aspect("equal", adjustable="datalim")
+        self.ax.grid(True, ls="--", lw=0.5)
+        self.line_est, = self.ax.plot([], [], "b-", lw=1.5, label="estimate")
+        self.line_gt,  = self.ax.plot([], [], "r-", lw=1.0, label="ground-truth")
+        self.ax.legend(loc="upper right")
+        self._est_xy: list[tuple[float, float]] = []
+        self._gt_xy:  list[tuple[float, float]] = []
+
+    # ------------------------------------------------------------------ #
+    def append(self,
+               est_pos: np.ndarray,
+               gt_pos:  Optional[np.ndarray] = None,
+               swap_axes: bool = False) -> None:
+        """
+        Add one position pair and refresh the plot.
+
+        Parameters
+        ----------
+        est_pos : (3,)  SLAM position in world coords.
+        gt_pos  : (3,) or None  aligned ground-truth, same frame.
+        swap_axes : plot x<->z if your dataset convention differs.
+        """
+        x, z = (est_pos[2], est_pos[0]) if swap_axes else (est_pos[0], est_pos[2])
+        self._est_xy.append((x, z))
+        ex, ez = zip(*self._est_xy)
+        self.line_est.set_data(ex, ez)
+
+        if gt_pos is not None:
+            gx, gz = (gt_pos[2], gt_pos[0]) if swap_axes else (gt_pos[0], gt_pos[2])
+            self._gt_xy.append((gx, gz))
+            gx_s, gz_s = zip(*self._gt_xy)
+            self.line_gt.set_data(gx_s, gz_s)
+
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
