@@ -74,13 +74,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # 3‑D visualisation toggle
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D matplotlib window")
     # triangulation depth filtering
-    p.add_argument("--min_depth", type=float, default=2)
-    p.add_argument("--max_depth", type=float, default=20.0)
+    p.add_argument("--min_depth", type=float, default=1.0)
+    p.add_argument("--max_depth", type=float, default=50.0)
 
     #  PnP / map-maintenance
     p.add_argument('--pnp_min_inliers', type=int, default=30)
-    p.add_argument('--proj_radius',     type=float, default=4.0)
-    p.add_argument('--merge_radius',    type=float, default=0.05)
+    p.add_argument('--proj_radius',     type=float, default=3.0)
+    p.add_argument('--merge_radius',    type=float, default=0.10)
 
     return p
 
@@ -234,17 +234,28 @@ def main():
                         pose_prev
                         @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T
                     ).T[:, :3]
-                    pts3d_world = world_map.align_points_to_map(
-                        pts3d_world, args.merge_radius)
-                    new_ids = world_map.add_points(pts3d_world)
+
+                    # ------------ sample RGB from img2 -------------
+                    pix = [kp2[m.trainIdx].pt for m in np.asarray(fresh)[valid]]
+                    cols = []
+                    h, w, _ = img2.shape
+                    for (u, v) in pix:
+                        x, y = int(round(u)), int(round(v))
+                        if 0 <= x < w and 0 <= y < h:
+                            b, g, r = img2[y, x]          # BGR uint8
+                            cols.append((r, g, b))        # keep RGB order
+                        else:
+                            cols.append((255, 255, 255))  # white fallback
+                    cols = np.float32(cols) / 255.0        # → 0-1
+
+                    new_ids = world_map.add_points(pts3d_world, cols)
 
                     frame_no = i + 1
                     for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
                         world_map.points[pid].add_observation(frame_no, m.trainIdx)
 
             if i % 10 == 0:
-                # world_map.merge_close(args.merge_radius)
-                pass
+                pts3d_world = world_map.align_points_to_map(pts3d_world, args.merge_radius) #TODO: merge close points
 
             # no keyframe → pure VO integration
             cur_pose = pose_pred
