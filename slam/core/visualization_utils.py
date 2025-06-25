@@ -1,7 +1,5 @@
 # visualization_utils.py
 from __future__ import annotations
-
-
 """
 visualization_utils.py
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -23,11 +21,24 @@ Main entry‑points
     key‑callback APIs.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Literal
 import warnings
 
 import cv2
 import numpy as np
+
+try:
+    import open3d as o3d  # type: ignore
+except Exception as exc:  # pragma: no cover
+    o3d = None  # type: ignore
+    _OPEN3D_ERR = exc
+else:
+    _OPEN3D_ERR = None
+
+from slam.core.landmark_utils import Map
+import numpy as np
+
+ColourAxis = Literal["x", "y", "z", "auto"]
 
 # --------------------------------------------------------------------------- #
 #  2‑D overlay helpers
@@ -79,21 +90,6 @@ def draw_tracks(
 # --------------------------------------------------------------------------- #
 #  3‑D visualiser  (Open3D only)                                             #
 # --------------------------------------------------------------------------- #
-
-try:
-    import open3d as o3d  # type: ignore
-except Exception as exc:  # pragma: no cover
-    o3d = None  # type: ignore
-    _OPEN3D_ERR = exc
-else:
-    _OPEN3D_ERR = None
-
-from slam.core.landmark_utils import Map
-from typing import Literal, Optional, Tuple, List
-import numpy as np
-
-ColourAxis = Literal["x", "y", "z", "auto"]
-
 
 class Visualizer3D:
     """Open3D window showing coloured landmarks & trajectory."""

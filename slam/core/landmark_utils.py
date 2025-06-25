@@ -16,10 +16,11 @@ visualisation stack.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
 
 # --------------------------------------------------------------------------- #
 #  MapPoint
@@ -73,9 +74,32 @@ class Map:
         if not self.points:
             return np.empty((0, 3))
         return np.stack([mp.position for mp in self.points.values()], axis=0)
-
+    
+    
     def __len__(self) -> int:
         return len(self.points)
+    
+    def merge_close(self, radius: float = 0.05) -> None: #REMOVE
+        """Average-merge landmarks whose centres are < `radius` apart."""
+        if len(self.points) < 2:
+            return
+        ids = list(self.points.keys())
+        pts = np.stack([self.points[i].position for i in ids])
+        keep, dead = set(), set()
+        for i, a in enumerate(ids):
+            if a in dead:
+                continue
+            for j, b in enumerate(ids[i + 1 :], i + 1):
+                if b in dead:
+                    continue
+                if np.linalg.norm(pts[i] - pts[j]) < radius:
+                    # simple average
+                    self.points[a].position = (pts[i] + pts[j]) * 0.5
+                    dead.add(b)
+            keep.add(a)
+        for d in dead:
+            self.points.pop(d, None)
+
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +135,6 @@ def triangulate_points(
     proj1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
     proj2 = K @ np.hstack((R, t.reshape(3, 1)))
 
-    pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T)
+    pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T) # TODO: do triangulation from scratch for N observations
     pts3d = (pts4d_h[:3] / pts4d_h[3]).T  # → (N,3)
     return pts3d
