@@ -74,8 +74,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # 3‑D visualisation toggle
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D matplotlib window")
     # triangulation depth filtering
-    p.add_argument("--min_depth", type=float, default=0.1)
-    p.add_argument("--max_depth", type=float, default=30.0)
+    p.add_argument("--min_depth", type=float, default=2)
+    p.add_argument("--max_depth", type=float, default=20.0)
 
     #  PnP / map-maintenance
     p.add_argument('--pnp_min_inliers', type=int, default=30)
@@ -184,68 +184,89 @@ def main():
         pose_prev = cur_pose.copy()
         pose_pred = cur_pose @ _pose_rt(R, t)
 
-        # -- PnP refinement using the existing map ------------------------ #
-        pts_w = world_map.get_point_array()
-        pts3d, pts2d, used_kp2 = associate_landmarks(
-                K, pose_pred, pts_w, kp2, args.proj_radius)
-
-        if len(pts3d) >= args.pnp_min_inliers:
-            R_pnp, t_pnp = refine_pose_pnp(K, pts3d, pts2d)
-            if R_pnp is not None:
-                # overwrite with refined absolute pose (world → camera)
-                cur_pose = np.eye(4)
-                cur_pose[:3, :3] = R_pnp.T
-                cur_pose[:3, 3]  = -R_pnp.T @ t_pnp
+        # ---------------- Key-frame decision -------------------------- #
+        if i == 0:
+            kfs.append(Keyframe(0, seq[0] if isinstance(seq[0], str) else "",
+                        kp1, des1, make_thumb(img1, tuple(args.kf_thumb_hw))))
+            last_kf_idx = 0
+            is_kf = False
         else:
-            # fall-back to pure VO
+            prev_len = len(kfs)
+            kfs, last_kf_idx = select_keyframe(
+                args, seq, i, img2, kp2, des2, matcher, kfs, last_kf_idx)
+            is_kf = len(kfs) > prev_len
+
+        cur_pose = pose_pred
+        used_kp2: list[int] = []
+        new_ids:  list[int] = []
+
+        if is_kf:
+            # -- PnP refinement using existing landmarks --
+            pts_w = world_map.get_point_array()
+            pts3d, pts2d, used_kp2 = associate_landmarks(K, pose_pred, pts_w, kp2, args.proj_radius)
+
+            if len(pts3d) >= args.pnp_min_inliers:
+                R_pnp, t_pnp = refine_pose_pnp(K, pts3d, pts2d)
+                if R_pnp is not None:
+                    cur_pose = np.eye(4)
+                    cur_pose[:3, :3] = R_pnp.T
+                    cur_pose[:3, 3] = -R_pnp.T @ t_pnp
+                else:
+                    cur_pose = pose_pred
+            else:
+                cur_pose = pose_pred
+
+            # --- Triangulate new landmarks only for keyframes ---
+            fresh = [m for m in matches if m.trainIdx not in set(used_kp2)]
+            if fresh:
+                pts1_new = np.float32([kp1[m.queryIdx].pt for m in fresh])
+                pts2_new = np.float32([kp2[m.trainIdx].pt for m in fresh])
+
+                rel = np.linalg.inv(pose_prev) @ cur_pose
+                R_rel, t_rel = rel[:3, :3], rel[:3, 3]
+                pts3d_cam = triangulate_points(K, R_rel, t_rel, pts1_new, pts2_new)
+                z = pts3d_cam[:, 2]
+                valid = (z > args.min_depth) & (z < args.max_depth)
+                pts3d_cam = pts3d_cam[valid]
+
+                if len(pts3d_cam):
+                    pts3d_world = (
+                        pose_prev
+                        @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T
+                    ).T[:, :3]
+                    pts3d_world = world_map.align_points_to_map(
+                        pts3d_world, args.merge_radius)
+                    new_ids = world_map.add_points(pts3d_world)
+
+                    frame_no = i + 1
+                    for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
+                        world_map.points[pid].add_observation(frame_no, m.trainIdx)
+
+            if i % 10 == 0:
+                # world_map.merge_close(args.merge_radius)
+                pass
+
+            # no keyframe → pure VO integration
             cur_pose = pose_pred
+
         world_map.add_pose(cur_pose)
 
-        # --- Triangulate new landmarks ---
-        fresh = [m for m in matches if m.trainIdx not in set(used_kp2)]
-        if fresh:
-            pts1_new = np.float32([kp1[m.queryIdx].pt for m in fresh])
-            pts2_new = np.float32([kp2[m.trainIdx].pt for m in fresh])
-
-            pts3d_cam = triangulate_points(K, R, t, pts1_new, pts2_new)
-            z = pts3d_cam[:, 2]
-            valid = (z > args.min_depth) & (z < args.max_depth)
-            pts3d_cam = pts3d_cam[valid]
-
-            if len(pts3d_cam):
-                pts3d_world = (
-                    pose_prev
-                    @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T
-                ).T[:, :3]
-                new_ids = world_map.add_points(pts3d_world)
-
-                frame_no = i + 1
-                for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
-                    world_map.points[pid].add_observation(frame_no, m.trainIdx)
-        else:
-            new_ids = []
-
-        # --- occasional map by merging close landmarks ---
-        if i % 10 == 0:
-            world_map.merge_close(args.merge_radius)
 
         # --- 2-D track maintenance (for GUI only) ---
         frame_no = i + 1
-        prev_map, tracks, next_track_id = update_and_prune_tracks(matches, prev_map, tracks, kp2, frame_no, next_track_id)
+        prev_map, tracks, next_track_id = update_and_prune_tracks(
+            matches, prev_map, tracks, kp2, frame_no, next_track_id)
 
-        # ---------------- Key-frame subsystem ---------------- #
-        # if we have no keyframes yet, bootstrap the first one
-        if i == 0:
-            kfs.append(Keyframe(0, seq[0] if isinstance(seq[0], str) else "",
-                                kp1, des1, make_thumb(img1, tuple(args.kf_thumb_hw))))
-            last_kf_idx = 0
-        else:
-            kfs, last_kf_idx = select_keyframe(args, seq, i, img2, kp2, des2, matcher, kfs, last_kf_idx)
 
         # --- 3-D visualisation ---
         if viz3d is not None and i % 3 == 0:
             viz3d.update(world_map, new_ids)
 
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            break
+        if key == ord('p') and viz3d is not None:
+            viz3d.paused = not viz3d.paused
         # # ---------------------- GUI FOR 2D feature Tracking -------------------------- #
         # vis = draw_tracks(img2.copy(), tracks, frame_no)
         # for t in prev_map.keys():
