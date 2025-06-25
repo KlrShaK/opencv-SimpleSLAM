@@ -215,8 +215,11 @@ class Visualizer3D:
             return
 
         pts = np.array([mp.position for mp in slam_map.points.values()])
-        scalars = self._compute_scalar(pts)
-        colours = self._colormap(self._normalise(scalars))
+        if hasattr(next(iter(slam_map.points.values())), "colour"):
+            colours = np.array([mp.colour for mp in slam_map.points.values()])
+        else:                           # backward-compat
+            scalars = self._compute_scalar(pts)
+            colours = self._colormap(self._normalise(scalars))
 
         if new_ids:
             id_to_i = {pid: i for i, pid in enumerate(slam_map.points.keys())}

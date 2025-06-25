@@ -31,6 +31,7 @@ class MapPoint:
 
     id: int
     position: np.ndarray  # shape (3,)
+    colour:    np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
     observations: List[Tuple[int, int]] = field(default_factory=list)  # (frame_idx, kp_idx)
 
     def add_observation(self, frame_idx: int, kp_idx: int) -> None:
@@ -56,14 +57,16 @@ class Map:
         self.poses.append(pose_w_c.copy())
 
     # ---------------- Landmarks ------------------------ #
-    def add_points(self, pts3d: np.ndarray) -> List[int]:
+    def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None) -> List[int]:
         """Add a set of 3‑D points and return the list of newly assigned ids."""
         if pts3d.ndim != 2 or pts3d.shape[1] != 3:
             raise ValueError("pts3d must be (N,3)")
         new_ids: List[int] = []
-        for p in pts3d:
+
+        colours = colours if colours is not None else np.ones_like(pts3d)
+        for p, c in zip(pts3d, colours):
             pid = self._next_pid
-            self.points[pid] = MapPoint(pid, p.astype(np.float64))
+            self.points[pid] = MapPoint(pid, p.astype(np.float64), c.astype(np.float32))
             new_ids.append(pid)
             self._next_pid += 1
         return new_ids
@@ -79,27 +82,52 @@ class Map:
     def __len__(self) -> int:
         return len(self.points)
     
-    def merge_close(self, radius: float = 0.05) -> None: #REMOVE
-        """Average-merge landmarks whose centres are < `radius` apart."""
+    def merge_close(self, radius: float = 0.05) -> None:
+        """Average-merge landmarks whose centres are closer than ``radius``."""
+
         if len(self.points) < 2:
             return
+
         ids = list(self.points.keys())
         pts = np.stack([self.points[i].position for i in ids])
-        keep, dead = set(), set()
-        for i, a in enumerate(ids):
-            if a in dead:
-                continue
-            for j, b in enumerate(ids[i + 1 :], i + 1):
-                if b in dead:
-                    continue
-                if np.linalg.norm(pts[i] - pts[j]) < radius:
-                    # simple average
-                    self.points[a].position = (pts[i] + pts[j]) * 0.5
-                    dead.add(b)
-            keep.add(a)
-        for d in dead:
-            self.points.pop(d, None)
+        tree = cKDTree(pts)
+        pairs = sorted(tree.query_pairs(radius))
 
+        removed: set[int] = set()
+        for i, j in pairs:
+            ida, idb = ids[i], ids[j]
+            if idb in removed or ida in removed:
+                continue
+            pa = self.points[ida].position
+            pb = self.points[idb].position
+            self.points[ida].position = (pa + pb) * 0.5
+            removed.add(idb)
+
+        for idx in removed:
+            self.points.pop(idx, None)
+
+
+    def align_points_to_map(self, pts: np.ndarray, radius: float = 0.05) -> np.ndarray:
+        """Rigidly align ``pts`` to existing landmarks using nearest neighbours."""
+        map_pts = self.get_point_array()
+        if len(map_pts) < 3 or len(pts) < 3:
+            return pts
+
+        tree = cKDTree(map_pts)
+        src, dst = [], []
+        for p in pts:
+            idxs = tree.query_ball_point(p, radius)
+            if idxs:
+                src.append(p)
+                dst.append(map_pts[idxs[0]])
+
+        if len(src) < 3:
+            return pts
+
+        from .pnp_utils import align_point_clouds
+        R, t = align_point_clouds(np.asarray(src), np.asarray(dst))
+        pts_aligned = (R @ pts.T + t[:, None]).T
+        return pts_aligned
 
 
 # --------------------------------------------------------------------------- #

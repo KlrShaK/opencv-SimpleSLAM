@@ -103,3 +103,36 @@ def refine_pose_pnp(
     )
     R, _ = cv2.Rodrigues(rvec)
     return R, tvec.ravel()  # R: 3×3, t: 3×1, # 1-D (3,) instead of (3,1)
+
+# --------------------------------------------------------------- #
+#  3-D ↔ 3-D alignment
+# --------------------------------------------------------------- #
+def align_point_clouds(
+    src: np.ndarray,  # N×3
+    dst: np.ndarray   # N×3
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Least-squares rigid alignment **src → dst** (no scale).
+
+    Returns rotation ``R`` and translation ``t`` such that
+
+    ``dst ≈ (R @ src.T + t).T``
+    """
+
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError("src/dst must both be (N,3)")
+
+    centroid_src = src.mean(axis=0)
+    centroid_dst = dst.mean(axis=0)
+
+    src_centered = src - centroid_src
+    dst_centered = dst - centroid_dst
+
+    H = src_centered.T @ dst_centered
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[2, :] *= -1
+        R = Vt.T @ U.T
+
+    t = centroid_dst - R @ centroid_src
+    return R, t
