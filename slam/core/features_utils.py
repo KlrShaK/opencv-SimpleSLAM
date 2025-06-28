@@ -98,7 +98,7 @@ def feature_extractor(args, img: np.ndarray, detector):
 
 
 def feature_matcher(args, kp0, kp1, des0, des1, matcher):
-    """Match features between two frames."""
+    """    Match features between two FrameFeatures and return OpenCV-compatible matches."""
     # optionally filter matches from LightGlue by confidence
     if args.use_lightglue:
         # LightGlue matching
