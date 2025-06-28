@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    default=[640, 360])
     
     # 3‑D visualisation toggle
-    p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D matplotlib window")
+    p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D visualization window")
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=1.0)
     p.add_argument("--max_depth", type=float, default=50.0)
@@ -277,7 +277,7 @@ def main():
         if gt_T is not None and i + 1 < len(gt_T):
             p_gt = gt_T[i + 1, :3, 3]                     # raw GT
             gt_pos = apply_alignment(p_gt, R_align, t_align)
-        plot2d.append(est_pos, gt_pos)
+        plot2d.append(est_pos, gt_pos, mirror_x=True)
 
 
         # # --- 2-D track maintenance (for GUI only) ---
@@ -287,7 +287,9 @@ def main():
 
 
         # --- 3-D visualisation ---
-        viz3d.update(world_map, new_ids)
+        if viz3d is not None:
+            viz3d.update(world_map, new_ids)
+
 
         key = cv2.waitKey(1) & 0xFF
         if key == 27:

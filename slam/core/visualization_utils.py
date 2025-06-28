@@ -286,7 +286,9 @@ class TrajectoryPlotter:
     def append(self,
                est_pos: np.ndarray,
                gt_pos:  Optional[np.ndarray] = None,
-               swap_axes: bool = False) -> None:
+               *,
+               swap_axes: bool = False,
+               mirror_x: bool = False) -> None:
         """
         Add one position pair and refresh the plot.
 
@@ -297,12 +299,16 @@ class TrajectoryPlotter:
         swap_axes : plot x<->z if your dataset convention differs.
         """
         x, z = (est_pos[2], est_pos[0]) if swap_axes else (est_pos[0], est_pos[2])
+        if mirror_x:
+                z = -z
         self._est_xy.append((x, z))
         ex, ez = zip(*self._est_xy)
         self.line_est.set_data(ex, ez)
 
         if gt_pos is not None:
             gx, gz = (gt_pos[2], gt_pos[0]) if swap_axes else (gt_pos[0], gt_pos[2])
+            # if mirror_x:
+            #     gx = -gx
             self._gt_xy.append((gx, gz))
             gx_s, gz_s = zip(*self._gt_xy)
             self.line_gt.set_data(gx_s, gz_s)

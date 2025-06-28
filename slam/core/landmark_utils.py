@@ -28,7 +28,7 @@ from scipy.spatial import cKDTree
 @dataclass
 class MapPoint:
     """A single triangulated 3‑D landmark."""
-
+    # TODO: Add reference to the keyframe(s) it was observed in
     id: int
     position: np.ndarray  # shape (3,)
     colour:    np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
