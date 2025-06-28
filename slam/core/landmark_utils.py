@@ -28,10 +28,10 @@ from scipy.spatial import cKDTree
 @dataclass
 class MapPoint:
     """A single triangulated 3‑D landmark."""
-    # TODO: Add reference to the keyframe(s) it was observed in
     id: int
     position: np.ndarray  # shape (3,)
-    colour:    np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
+    keyframe_idx: int = -1
+    colour: np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
     observations: List[Tuple[int, int]] = field(default_factory=list)  # (frame_idx, kp_idx)
 
     def add_observation(self, frame_idx: int, kp_idx: int) -> None:
@@ -57,7 +57,8 @@ class Map:
         self.poses.append(pose_w_c.copy())
 
     # ---------------- Landmarks ------------------------ #
-    def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None) -> List[int]:
+    def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None,
+                   keyframe_idx: int = -1) -> List[int]:
         """Add a set of 3‑D points and return the list of newly assigned ids."""
         if pts3d.ndim != 2 or pts3d.shape[1] != 3:
             raise ValueError("pts3d must be (N,3)")
@@ -66,7 +67,12 @@ class Map:
         colours = colours if colours is not None else np.ones_like(pts3d)
         for p, c in zip(pts3d, colours):
             pid = self._next_pid
-            self.points[pid] = MapPoint(pid, p.astype(np.float64), c.astype(np.float32))
+            self.points[pid] = MapPoint(
+                pid,
+                p.astype(np.float64),
+                keyframe_idx,
+                c.astype(np.float32),
+            )
             new_ids.append(pid)
             self._next_pid += 1
         return new_ids

@@ -98,10 +98,8 @@ def feature_extractor(args, img: np.ndarray, detector):
 
 
 def feature_matcher(args, kp0, kp1, des0, des1, matcher):
-    """
-    Match features between two FrameFeatures and return OpenCV-compatible matches.
-    """
-    # TODO: add min_conf filtering
+    """Match features between two frames."""
+    # optionally filter matches from LightGlue by confidence
     if args.use_lightglue:
         # LightGlue matching
         # kp0, kp1: List[cv2.KeyPoint]
@@ -118,6 +116,10 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
         })
         raw = rbd(raw)
         matches_raw = raw['matches']
+        conf = raw.get('scores') or raw.get('confidence')
+        if conf is not None:
+            mask = conf > args.min_conf
+            matches_raw = matches_raw[mask]
         # convert index pairs to cv2.DMatch list
         cv_matches = _convert_lg_matches_to_opencv(matches_raw)
         return cv_matches

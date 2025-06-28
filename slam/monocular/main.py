@@ -61,6 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    default='orb')
     p.add_argument('--matcher', choices=['bf'], default='bf')
     p.add_argument('--use_lightglue', action='store_true')
+    p.add_argument('--min_conf', type=float, default=0.5,
+                   help='Minimum LightGlue confidence for a match')
     # runtime
     p.add_argument('--fps', type=float, default=10)
     # RANSAC
@@ -260,8 +262,10 @@ def main():
 
                     # coarse rigid alignment of the *new* cloud to the map
                     pts3d_world = world_map.align_points_to_map(pts3d_world, radius=args.merge_radius * 2.0)  # TODO: HYPER PARAMETER CHECK -MAGIC VARIABLE- radius can be loose here
-                    new_ids = world_map.add_points(pts3d_world, cols)
                     frame_no = i + 1
+                    new_ids = world_map.add_points(
+                        pts3d_world, cols, keyframe_idx=frame_no
+                    )
                     for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
                         world_map.points[pid].add_observation(frame_no, m.trainIdx)
 
