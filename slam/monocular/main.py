@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    default='orb')
     p.add_argument('--matcher', choices=['bf'], default='bf')
     p.add_argument('--use_lightglue', action='store_true')
-    p.add_argument('--min_conf', type=float, default=0.5,
+    p.add_argument('--min_conf', type=float, default=0.7,
                    help='Minimum LightGlue confidence for a match')
     # runtime
     p.add_argument('--fps', type=float, default=10)
