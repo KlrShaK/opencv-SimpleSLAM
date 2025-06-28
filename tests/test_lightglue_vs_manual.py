@@ -32,7 +32,8 @@ def test_lightglue_pipeline_matches_manual(synthetic_pair):
     # build a fake args object
     args = SimpleNamespace(use_lightglue=True,
                            detector=None,  # not used for LG
-                           matcher=None)
+                           matcher=None,
+                           min_conf=0.0)
 
     # 1) initialize LightGlue extractor & matcher
     extractor, matcher = init_feature_pipeline(args)
