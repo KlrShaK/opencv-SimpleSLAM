@@ -116,7 +116,9 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
         })
         raw = rbd(raw)
         matches_raw = raw['matches']
-        conf = raw.get('scores') or raw.get('confidence')
+        # LightGlue may return confidence either as 'scores' or 'confidence'.
+        # Avoid `or` with tensors to prevent ambiguity errors.
+        conf = raw['scores'] if 'scores' in raw else raw.get('confidence')
         if conf is not None:
             mask = conf > args.min_conf
             matches_raw = matches_raw[mask]
