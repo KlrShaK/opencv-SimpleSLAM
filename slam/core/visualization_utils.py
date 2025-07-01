@@ -22,7 +22,7 @@ Main entry‑points
 """
 
 from typing import Dict, List, Tuple, Optional, Literal
-import warnings
+import warnings, threading, cv2, numpy as np
 
 import cv2
 import numpy as np
@@ -45,11 +45,8 @@ ColourAxis = Literal["x", "y", "z", "auto"]
 # --------------------------------------------------------------------------- #
 
 class Visualizer3D:
-    """Open3D window showing coloured landmarks & trajectory."""
+    """Open3D window that shows the coloured point-cloud and camera path."""
 
-    # ------------------------------------------------------------------ #
-    #  Construction
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
         color_axis: ColourAxis = "z",
@@ -58,20 +55,25 @@ class Visualizer3D:
         window_size: Tuple[int, int] = (1280, 720),
         nav_step: float = 0.25,
     ) -> None:
-        self.backend = "none"
-        self._closed = False
+        self.backend  = "none"
+        self._closed  = False
+        self._lock    = threading.Lock()
+        self.paused   = False
 
         self.color_axis = color_axis
-        self.new_colour = np.array(new_colour, float)
-        self.nav_step = nav_step
+        self.new_colour = np.asarray(new_colour, dtype=np.float32)
+        self.nav_step   = nav_step
 
-        # running stats for colour normalisation
+        # scalar-to-colour normalisation
         self._v_min: Optional[float] = None
         self._v_max: Optional[float] = None
-        self._pc_vec: Optional[np.ndarray] = None  # PCA axis for auto mode
+        self._pc_vec: Optional[np.ndarray] = None  # PCA axis for "auto"
 
+        # ------------------------------------------------------------------ #
+        #  Open3D init
+        # ------------------------------------------------------------------ #
         if o3d is None:
-            warnings.warn(f"Open3D missing → visualiser disabled ({_OPEN3D_ERR})")
+            warnings.warn(f"[Visualizer3D] Open3D missing → window disabled ({_OPEN3D_ERR})")
             return
 
         vis_cls = (
@@ -83,8 +85,7 @@ class Visualizer3D:
         self.vis.create_window("SLAM Map", width=window_size[0], height=window_size[1])
         self.backend = "open3d"
 
-        # geometry holders
-        self.pcd = o3d.geometry.PointCloud()
+        self.pcd   = o3d.geometry.PointCloud()
         self.lines = o3d.geometry.LineSet()
         self._first = True
 
@@ -94,46 +95,45 @@ class Visualizer3D:
         print(f"[Visualizer3D] ready | colour_axis={self.color_axis}")
 
     # ------------------------------------------------------------------ #
-    #  Navigation keys (WASDQE)
+    #  WASDQE first-person navigation
     # ------------------------------------------------------------------ #
     def _bind_nav_keys(self):
         vc = self.vis.get_view_control()
 
         def translate(delta: np.ndarray):
             cam = vc.convert_to_pinhole_camera_parameters()
-            T = np.eye(4)
-            T[:3, 3] = delta * self.nav_step
+            T = np.eye(4);  T[:3, 3] = delta * self.nav_step
             cam.extrinsic = T @ cam.extrinsic
             vc.convert_from_pinhole_camera_parameters(cam)
             return False
 
         key_map = {
             ord("W"): np.array([0, 0, -1]),
-            ord("S"): np.array([0, 0, 1]),
+            ord("S"): np.array([0, 0,  1]),
             ord("A"): np.array([-1, 0, 0]),
-            ord("D"): np.array([1, 0, 0]),
-            ord("Q"): np.array([0, 1, 0]),
+            ord("D"): np.array([ 1, 0, 0]),
+            ord("Q"): np.array([0,  1, 0]),
             ord("E"): np.array([0, -1, 0]),
         }
         for k, v in key_map.items():
             self.vis.register_key_callback(k, lambda _v, vec=v: translate(vec))
 
     # ------------------------------------------------------------------ #
-    #  Scalar & colour helpers
+    #  Helpers for colour mapping
     # ------------------------------------------------------------------ #
     def _compute_scalar(self, pts: np.ndarray) -> np.ndarray:
         if self.color_axis in ("x", "y", "z"):
             return pts[:, {"x": 0, "y": 1, "z": 2}[self.color_axis]]
-        if self._pc_vec is None:
-            centred = pts - pts.mean(axis=0)
+        if self._pc_vec is None:                 # first call → PCA axis
+            centred = pts - pts.mean(0)
             _, _, vh = np.linalg.svd(centred, full_matrices=False)
             self._pc_vec = vh[0]
         return pts @ self._pc_vec
 
     def _normalise(self, scalars: np.ndarray) -> np.ndarray:
-        if self._v_min is None:
+        if self._v_min is None:                  # initialise 5th–95th perc.
             self._v_min, self._v_max = np.percentile(scalars, [5, 95])
-        else:
+        else:                                    # expand running min / max
             self._v_min = min(self._v_min, scalars.min())
             self._v_max = max(self._v_max, scalars.max())
         return np.clip((scalars - self._v_min) / (self._v_max - self._v_min + 1e-6), 0, 1)
@@ -143,79 +143,84 @@ class Visualizer3D:
             import matplotlib.cm as cm
             return cm.get_cmap("turbo")(norm)[:, :3]
         except Exception:
+            # fall-back: simple HSV → RGB
             h = (1 - norm) * 240
-            c = np.ones_like(h)
+            c = np.ones_like(h); m = np.zeros_like(h)
             x = c * (1 - np.abs((h / 60) % 2 - 1))
-            m = np.zeros_like(h)
-            rgb = np.select(
+            return np.select(
                 [h < 60, h < 120, h < 180, h < 240, h < 300, h >= 300],
                 [
-                    np.stack([c, x, m], 1),
-                    np.stack([x, c, m], 1),
-                    np.stack([m, c, x], 1),
-                    np.stack([m, x, c], 1),
-                    np.stack([x, m, c], 1),
-                    np.stack([c, m, x], 1),
-                ],
-            )
-            return rgb
+                    np.stack([c, x, m], 1), np.stack([x, c, m], 1),
+                    np.stack([m, c, x], 1), np.stack([m, x, c], 1),
+                    np.stack([x, m, c], 1), np.stack([c, m, x], 1),
+                ])
 
     # ------------------------------------------------------------------ #
-    #  Public update
+    #  Public interface
     # ------------------------------------------------------------------ #
     def update(self, slam_map: Map, new_ids: Optional[List[int]] = None):
         if self.backend != "open3d" or len(slam_map.points) == 0:
             return
+        if self.paused:
+            with self._lock:
+                self.vis.poll_events(); self.vis.update_renderer()
+            return
 
-        pts = np.array([mp.position for mp in slam_map.points.values()])
-        if hasattr(next(iter(slam_map.points.values())), "colour"):
-            colours = np.array([mp.colour for mp in slam_map.points.values()])
-        else:                           # backward-compat
-            scalars = self._compute_scalar(pts)
-            colours = self._colormap(self._normalise(scalars))
+        # -------------------------- build numpy arrays -------------------------
+        pts = slam_map.get_point_array()
+        col = slam_map.get_color_array() if hasattr(slam_map, "get_color_array") else None
+        if col is None or len(col) == 0:            # legacy maps without colour
+            scal  = self._compute_scalar(pts)
+            col   = self._colormap(self._normalise(scal))
+        else:
+            col = col.astype(np.float32)
 
+        # keep arrays in sync (pad / trim)
+        if len(col) < len(pts):
+            diff = len(pts) - len(col)
+            col  = np.vstack([col, np.full((diff, 3), 0.8, np.float32)])
+        elif len(col) > len(pts):
+            col  = col[: len(pts)]
+
+        # highlight newly-added landmarks
         if new_ids:
-            id_to_i = {pid: i for i, pid in enumerate(slam_map.points.keys())}
+            id_to_i = {pid: i for i, pid in enumerate(slam_map.point_ids())}
             for nid in new_ids:
                 if nid in id_to_i:
-                    colours[id_to_i[nid]] = self.new_colour
+                    col[id_to_i[nid]] = self.new_colour
 
-        self.pcd.points = o3d.utility.Vector3dVector(pts)
-        self.pcd.colors = o3d.utility.Vector3dVector(colours)
+        # ----------------------- Open3D geometry update ------------------------
+        with self._lock:
+            self.pcd.points  = o3d.utility.Vector3dVector(pts)
+            self.pcd.colors  = o3d.utility.Vector3dVector(col)
 
-        self._update_lineset(slam_map)
+            self._update_lineset(slam_map)
 
-        if self._first:
-            self.vis.add_geometry(self.pcd)
-            self.vis.add_geometry(self.lines)
-            self._first = False
-        else:
-            self.vis.update_geometry(self.pcd)
-            self.vis.update_geometry(self.lines)
+            if self._first:
+                self.vis.add_geometry(self.pcd); self.vis.add_geometry(self.lines)
+                self._first = False
+            else:
+                self.vis.update_geometry(self.pcd); self.vis.update_geometry(self.lines)
 
-        self.vis.poll_events()
-        self.vis.update_renderer()
+            self.vis.poll_events(); self.vis.update_renderer()
 
     # ------------------------------------------------------------------ #
-    #  Trajectory helper
+    #  Blue camera trajectory poly-line
     # ------------------------------------------------------------------ #
     def _update_lineset(self, slam_map: Map):
         if len(slam_map.poses) < 2:
             return
-        path = np.array([p[:3, 3] for p in slam_map.poses])
+        path = np.asarray([p[:3, 3] for p in slam_map.poses], np.float32)
         self.lines.points = o3d.utility.Vector3dVector(path)
-        self.lines.lines = o3d.utility.Vector2iVector([[i, i + 1] for i in range(len(path) - 1)])
+        self.lines.lines  = o3d.utility.Vector2iVector([[i, i + 1] for i in range(len(path) - 1)])
         self.lines.colors = o3d.utility.Vector3dVector(np.tile([[0, 0, 1]], (len(path) - 1, 1)))
 
     # ------------------------------------------------------------------ #
-    #  Teardown
+    #  Clean shutdown
     # ------------------------------------------------------------------ #
     def close(self):
         if self.backend == "open3d" and not self._closed:
-            self.vis.destroy_window()
-            self._closed = True
-
-
+            self.vis.destroy_window(); self._closed = True
 # --------------------------------------------------------------------------- #
 #  2‑D overlay helpers
 # --------------------------------------------------------------------------- #
