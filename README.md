@@ -19,6 +19,17 @@ python -m pip install -e .
   - intall ```requirements.txt```
   - ```bash scripts/run_tracker_visualization.sh```
 
+## INSTALLING COLMAP
+![Image showing commands](media/colmap_instruc.png)
+use this command - ```ninja -j4 -l 8 > build.log 2>&1```
+
+
+for pycolmap - https://colmap.github.io/pycolmap/index.html#pycolmap-index
+
+refer the image if when running the command it freezes and crashes
+![pycolmap instructions- Image showing commands](media/pycolmap_instruc.png)
+
+
 ## Overview
 
 This repository contains two Python scripts that demonstrate basic Structure-from-Motion (SfM) pipelines:
