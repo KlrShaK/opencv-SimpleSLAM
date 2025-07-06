@@ -42,8 +42,9 @@ def multi_view_triangulation(
     # Cheats: cheirality, depth & reprojection
     reproj, depths = [], []
     for T_w_c, (u, v) in zip(poses_w_c, pts2d):
-        pc = (np.linalg.inv(T_w_c) @ np.append(X, 1.0))[:3]
+        pc = - (np.linalg.inv(T_w_c) @ np.append(X, 1.0))[:3] # TODO ref-T1: NEW added '-', works not correct but works for now
         if pc[2] <= 0:                             # behind the camera
+            # print("Cheirality check failed:", pc)
             return None
         depths.append(pc[2])
 
@@ -51,8 +52,10 @@ def multi_view_triangulation(
         reproj.append(np.linalg.norm(uv_hat - (u, v)))
 
     if not (min_depth <= np.mean(depths) <= max_depth):
+        # print(f"Depth check failed: {np.mean(depths)} not in [{min_depth}, {max_depth}]")
         return None
     if np.mean(reproj) > max_rep_err:
+        # print(f"Reprojection error check failed: {np.mean(reproj)} > {max_rep_err}")
         return None
     return X
 
@@ -116,7 +119,7 @@ class MultiViewTriangulator:
         for tid, obs in list(self._track_obs.items()):
             if tid in self._triangulated or len(obs) < self.min_views:
                 continue
-
+            
             obs_sorted = sorted(obs, key=lambda o: o.kf_idx)
             poses, pts2d = [], []
             for o in obs_sorted:
@@ -126,12 +129,14 @@ class MultiViewTriangulator:
                 poses.append(pose)
                 pts2d.append(o.uv)
             else:
+                print(f"Triangulating track {tid} with {len(obs)} observations")
                 X = multi_view_triangulation(
                     self.K, poses, np.float32(pts2d),
                     min_depth=self.min_depth,
                     max_depth=self.max_depth,
                     max_rep_err=self.max_rep_err,
                 )
+                print(" Triangulated 3D point:", X)
                 if X is None:
                     continue
 
