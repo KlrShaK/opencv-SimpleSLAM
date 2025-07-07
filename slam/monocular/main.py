@@ -1,5 +1,7 @@
 # main.py
 """
+WITHOUT MULTI-VIEW TRIANGULATION
+
 Entry-point: high-level processing loop
 --------------------------------------
 $ python main.py --dataset kitti --base_dir ../Dataset
@@ -43,8 +45,7 @@ from slam.core.keyframe_utils import (
 
 from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
-from slam.core.landmark_utils import Map
-from slam.core.multi_view_utils import MultiViewTriangulator
+from slam.core.landmark_utils import Map, triangulate_points
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
 
 
@@ -80,13 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=1.0)
     p.add_argument("--max_depth", type=float, default=50.0)
-    p.add_argument('--max_rep_err', type=float, default=2.5,
-               help='max mean reprojection error (px) for multi-view triangulation')
-    
-    # multi-view triangulation
-    p.add_argument('--mv_views', type=int, default=3,
-                help='minimum keyframes required before triangulating a track')
-    
+
     #  PnP / map-maintenance
     p.add_argument('--pnp_min_inliers', type=int, default=30)
     p.add_argument('--proj_radius',     type=float, default=3.0)
@@ -144,14 +139,6 @@ def main():
     # --- tracking state ---
     prev_map, tracks = {}, {}
     next_track_id = 0
-    mv_triangulator = MultiViewTriangulator(
-    K,
-    min_views    = args.mv_views,
-    merge_radius = args.merge_radius,
-    max_rep_err  = args.max_rep_err,
-    min_depth    = args.min_depth,
-    max_depth    = args.max_depth,
-)
 
     world_map = Map()
     cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
@@ -182,11 +169,6 @@ def main():
         # --- filter matches with RANSAC ---
         matches = filter_matches_ransac(kp1, kp2, matches, args.ransac_thresh)
 
-        # # --- 2-D Feature track maintenance ---
-        frame_no = i + 1
-        prev_map, tracks, next_track_id = update_and_prune_tracks(
-            matches, prev_map, tracks, kp2, frame_no, next_track_id)
-        
         if len(matches) < 12:
             print(f"[WARN] Not enough matches at frame {i}. Skipping.")
             continue
@@ -248,12 +230,49 @@ def main():
             else:
                 cur_pose = pose_pred
 
-            # --- Triangulate Keyframe observations when ready (enough keyframes) ---
-            mv_triangulator.add_keyframe(frame_no, cur_pose, kp2, prev_map, img2)
-            new_ids = mv_triangulator.triangulate_ready_tracks(world_map)
+            # --- Triangulate new landmarks only for keyframes ---
+            fresh = [m for m in matches if m.trainIdx not in set(used_kp2)]
+            if fresh:
+                pts1_new = np.float32([kp1[m.queryIdx].pt for m in fresh])
+                pts2_new = np.float32([kp2[m.trainIdx].pt for m in fresh])
 
-            # if i % 10 == 0:
-            #     world_map.fuse_closeby_duplicate_landmarks(args.merge_radius)
+                rel = np.linalg.inv(pose_prev) @ cur_pose
+                R_rel, t_rel = rel[:3, :3], rel[:3, 3]
+                pts3d_cam = triangulate_points(K, R_rel, t_rel, pts1_new, pts2_new)
+                z = pts3d_cam[:, 2]
+                valid = (z > args.min_depth) & (z < args.max_depth)
+                pts3d_cam = pts3d_cam[valid]
+
+                if len(pts3d_cam):
+                    pts3d_world = (
+                        pose_prev
+                        @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T
+                    ).T[:, :3]
+
+                    # ------------ sample RGB from img2 -------------
+                    pix = [kp2[m.trainIdx].pt for m in np.asarray(fresh)[valid]]
+                    cols = []
+                    h, w, _ = img2.shape
+                    for (u, v) in pix:
+                        x, y = int(round(u)), int(round(v))
+                        if 0 <= x < w and 0 <= y < h:
+                            b, g, r = img2[y, x]          # BGR uint8
+                            cols.append((r, g, b))        # keep RGB order
+                        else:
+                            cols.append((255, 255, 255))  # white fallback
+                    cols = np.float32(cols) / 255.0        # → 0-1
+
+                    # coarse rigid alignment of the *new* cloud to the map
+                    pts3d_world = world_map.align_points_to_map(pts3d_world, radius=args.merge_radius * 2.0)  # TODO: HYPER PARAMETER CHECK -MAGIC VARIABLE- radius can be loose here
+                    frame_no = i + 1
+                    new_ids = world_map.add_points(
+                        pts3d_world, cols, keyframe_idx=frame_no
+                    )
+                    for pid, m in zip(new_ids, np.asarray(fresh)[valid]):
+                        world_map.points[pid].add_observation(frame_no, m.trainIdx)
+
+            if i % 10 == 0:
+                world_map.fuse_closeby_duplicate_landmarks(args.merge_radius)
 
 
         world_map.add_pose(cur_pose)
@@ -283,7 +302,6 @@ def main():
             break
         if key == ord('p') and viz3d is not None:
             viz3d.paused = not viz3d.paused
-            
         # # ---------------------- GUI FOR 2D feature Tracking -------------------------- #
         # vis = draw_tracks(img2.copy(), tracks, frame_no)
         # for t in prev_map.keys():

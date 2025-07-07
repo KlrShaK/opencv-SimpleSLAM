@@ -16,7 +16,7 @@ set -e
 # ==============================================
 # 2) (Alternative) Run with ALIKED + LightGlue:
 # ==============================================
-python3 -m slam.monocular.main \
+python3 -m slam.monocular.main2 \
   --dataset kitti \
   --base_dir ./Dataset \
   --use_lightglue \

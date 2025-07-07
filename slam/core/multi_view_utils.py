@@ -129,14 +129,14 @@ class MultiViewTriangulator:
                 poses.append(pose)
                 pts2d.append(o.uv)
             else:
-                print(f"Triangulating track {tid} with {len(obs)} observations")
+                # print(f"Triangulating track {tid} with {len(obs)} observations")
                 X = multi_view_triangulation(
                     self.K, poses, np.float32(pts2d),
                     min_depth=self.min_depth,
                     max_depth=self.max_depth,
                     max_rep_err=self.max_rep_err,
                 )
-                print(" Triangulated 3D point:", X)
+                # print(" Triangulated 3D point:", X)
                 if X is None:
                     continue
 

@@ -9,3 +9,4 @@ tqdm==4.67.1
 open3d==0.18.0
 pyceres==2.3
 pycolmap==3.10.0
+lz4==4.4.4
