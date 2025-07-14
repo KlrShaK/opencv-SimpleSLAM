@@ -15,6 +15,7 @@ class Keyframe:
     path:  str                    # "" for in-memory frames
     kps:   list[cv2.KeyPoint]
     desc:  np.ndarray
+    pose: np.ndarray              # 4×4 camera-to-world pose
     thumb: bytes                  # lz4-compressed JPEG
 
 
@@ -38,23 +39,25 @@ def is_new_keyframe(frame_idx,
     """
     Decide whether current frame should be promoted to a Keyframe.
     """
-    if frame_idx - last_kf_idx < kf_cooldown:
-        return False
+    if frame_idx - last_kf_idx > kf_cooldown: 
+        return True  # enough time has passed since last KF
     if not matches_to_kf:
         return True
     if len(matches_to_kf) < kf_min_inliers:
         return True
-
+    # TODO as a ratio of frame rather than pixels
     disp = [np.hypot(kp_curr[m.trainIdx].pt[0] - kp_kf[m.queryIdx].pt[0],
                      kp_curr[m.trainIdx].pt[1] - kp_kf[m.queryIdx].pt[1])
             for m in matches_to_kf]
     return np.mean(disp) > kf_max_disp
 
+# TODO add pose
 def select_keyframe(
     args,
     seq: List[str],
     frame_idx: int,
     img2, kp2, des2,
+    pose2,
     matcher,
     kfs: List[Keyframe],
     last_kf_idx: int
@@ -70,12 +73,12 @@ def select_keyframe(
         Original sequence list (so we can grab file paths if needed).
     frame_idx
         Zero-based index of the *first* of the pair.  Keyframes use i+1 as frame number.
-    img1, img2
-        BGR images for frames i, i+1 (for thumbnail if we promote).
-    kp1, des1
-        KPs/descriptors of frame i.
+    img2
+        BGR image for frame i+1 (for thumbnail if we promote).
     kp2, des2
         KPs/descriptors of frame i+1.
+    pose2
+        Current camera-to-world pose estimate for frame i+1 (4×4).  May be None.
     matcher
         Either the OpenCV BF/FLANN matcher or the LightGlue matcher.
     kfs
@@ -106,10 +109,11 @@ def select_keyframe(
                        args.kf_cooldown, last_kf_idx):
         thumb = make_thumb(img2, tuple(args.kf_thumb_hw))
         path  = seq[frame_idx + 1] if isinstance(seq[frame_idx + 1], str) else ""
-        kfs.append(Keyframe(frame_no, path, kp2, des2, thumb))
+        kfs.append(Keyframe(frame_no, path, kp2, des2, pose2, thumb))
         last_kf_idx = frame_no
 
     return kfs, last_kf_idx
+
 
 # --------------------------------------------------------------------------- #
 #  Track maintenance

@@ -201,7 +201,7 @@ def triangulate_points(
         raise ValueError("pts1/pts2 must be (N,2)")
 
     proj1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
-    proj2 = K @ np.hstack((R, t.reshape(3, 1)))
+    proj2 = K @ np.hstack((R, t.reshape(3, 1))) # Equivalent to proj1 @ get_homo_from_pose_rt(R, t)
 
     pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T) # TODO: do triangulation from scratch for N observations
     pts3d = (pts4d_h[:3] / pts4d_h[3]).T  # → (N,3)
