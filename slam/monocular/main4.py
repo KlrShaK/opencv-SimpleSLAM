@@ -78,7 +78,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # key-frame params
     p.add_argument('--kf_max_disp', type=float, default=45)
     p.add_argument('--kf_min_inliers', type=float, default=150)
-    p.add_argument('--kf_cooldown', type=int, default=3)
+    p.add_argument('--kf_cooldown', type=int, default=5)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2,
                    default=[640, 360])
     
@@ -87,7 +87,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.60)
     p.add_argument("--max_depth", type=float, default=50.0)
-    p.add_argument('--mvt_rep_err', type=float, default=2.0,
+    p.add_argument('--mvt_rep_err', type=float, default=30.0,
                help='Max mean reprojection error (px) for multi-view triangulation')
 
     #  PnP / map-maintenance
@@ -155,6 +155,7 @@ def try_bootstrap(K, kp0, kp1, matches, args, world_map):
     p1 = pts1[mask]
     pts3d = triangulate_points(K, R, t, p0, p1)
     z = pts3d[:, 2]
+    # print(z, "mean depth:", np.mean(z))
     ok = (z > args.min_depth) & (z < args.max_depth)
     pts3d = pts3d[ok]
 
@@ -197,79 +198,15 @@ def solve_pnp_step(K, pose_pred, world_map, kp, args):
     if R is None:
         return False, pose_pred, used
 
-    T = np.eye(4)
-    T[:3, :3] = R.T
-    T[:3, 3]  = -R.T @ t
+    R_wc = R.T
+    t_wc = -R.T @ t
+    pose_w_c = np.eye(4, dtype=np.float32)
+    pose_w_c[:3,:3] = R_wc
+    pose_w_c[:3, 3] = t_wc
+
     print(f"[PNP] Pose refined with {len(pts3d)} inliers.")
-    return True, T, used
+    return True, pose_w_c, used
 
-
-# def triangulate_new_points(K, pose_prev, pose_cur,
-#                            kp_prev, kp_cur, matches,
-#                            used_cur_idx, args, world_map, img_cur):
-#     """
-#     Triangulate *all* keypoints that are ❶ un-tracked in the current
-#     key-frame and ❷ fall inside the [min_depth , max_depth] band.
-
-#     The former parallax (bearing-angle) gate is gone, so we return more
-#     candidate landmarks per key-frame.  Depth filtering is kept to
-#     avoid the most obvious degeneracies (z≈0 or way too far).
-#     """
-#     # ------------------------------------------------------------------
-#     # 1) keep only keypoints that PnP did **not** consume
-#     # ------------------------------------------------------------------
-#     fresh = [m for m in matches if m.trainIdx not in used_cur_idx]
-#     if not fresh:
-#         return []                       # nothing new to add this time
-
-#     p0 = np.float32([kp_prev[m.queryIdx].pt for m in fresh])
-#     p1 = np.float32([kp_cur[m.trainIdx].pt  for m in fresh])
-
-#     # ------------------------------------------------------------------
-#     # 2) triangulate once per key-frame pair
-#     # ------------------------------------------------------------------
-#     rel       = np.linalg.inv(pose_prev) @ pose_cur
-#     R_rel     = rel[:3, :3]
-#     t_rel     = rel[:3, 3]
-
-#     pts3d_cam = triangulate_points(K, R_rel, t_rel, p0, p1)
-
-#     # ------------------------------------------------------------------
-#     # 3) depth sanity check (keep only z within user bounds)
-#     # ------------------------------------------------------------------
-#     z          = pts3d_cam[:, 2]
-#     depth_ok   = (z > args.min_depth) & (z < args.max_depth)
-#     if not depth_ok.any():
-#         return []                       # everything was outside bounds
-
-#     pts3d_cam  = pts3d_cam[depth_ok]
-#     fresh      = [m for m, ok in zip(fresh, depth_ok) if ok]
-
-#     # ------------------------------------------------------------------
-#     # 4) colour sampling for the surviving points (optional but nice)
-#     # ------------------------------------------------------------------
-#     h, w, _ = img_cur.shape
-#     pix  = [kp_cur[m.trainIdx].pt for m in fresh]
-#     cols = []
-#     for (u, v) in pix:
-#         x, y = int(round(u)), int(round(v))
-#         if 0 <= x < w and 0 <= y < h:
-#             b, g, r = img_cur[y, x]
-#             cols.append((r, g, b))
-#         else:
-#             cols.append((255, 255, 255))
-#     cols = np.float32(cols) / 255.0
-
-#     # ------------------------------------------------------------------
-#     # 5) transform to world frame and commit to the map
-#     # ------------------------------------------------------------------
-#     pts3d_w = pose_prev @ np.hstack([pts3d_cam, np.ones((len(pts3d_cam), 1))]).T
-#     pts3d_w = pts3d_w.T[:, :3]
-
-#     new_ids = world_map.add_points(pts3d_w, cols,
-#                                    keyframe_idx=len(world_map.poses) - 1)
-#     print(f"[TRIANGULATION] Added {len(new_ids)} new landmarks.")
-#     return new_ids, fresh
 
 def triangulate_new_points(K, pose_prev, pose_cur,
                            kp_prev, kp_cur, matches,
@@ -284,7 +221,8 @@ def triangulate_new_points(K, pose_prev, pose_cur,
     p1 = np.float32([kp_cur[m.trainIdx].pt  for m in fresh])
 
     # -- baseline / parallax test (ORB-SLAM uses θ ≈ 1°)
-    rel = np.linalg.inv(pose_prev) @ pose_cur
+    # rel = np.linalg.inv(pose_prev) @ pose_cur
+    rel = np.linalg.inv(pose_cur) @ pose_prev  # c₂ → c₁
     R_rel, t_rel = rel[:3, :3], rel[:3, 3]
     cos_thresh = np.cos(np.deg2rad(1.0))
 
@@ -461,19 +399,24 @@ def main():
         if not ok_pnp:                      # fallback to 2-D-2-D if PnP failed
             print(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
             # raise  Exception(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
-            if is_kf:
+            if not is_kf:
                 last_kf = kfs[-1]
             else:
                 last_kf = kfs[-2] if len(kfs) > 1 else kfs[0]
-            pts0 = np.float32([last_kf.kps[m.queryIdx].pt for m in matches])
-            pts1 = np.float32([kp2[m.trainIdx].pt  for m in matches])
+
+            tracking_matches = feature_matcher(args, last_kf.kps, kp2, last_kf.desc, des2, matcher)
+            tracking_matches = filter_matches_ransac(last_kf.kps, kp2, tracking_matches, args.ransac_thresh)
+
+            pts0 = np.float32([last_kf.kps[m.queryIdx].pt for m in tracking_matches])
+            pts1 = np.float32([kp2[m.trainIdx].pt  for m in tracking_matches])
             E, mask = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC,
                                         0.999, args.ransac_thresh)
             if E is None:
                 tracking_lost = True
                 continue
             _, R, t, mpose = cv2.recoverPose(E, pts0, pts1, K)
-            cur_pose = cur_pose @ get_homo_from_pose_rt(R, t)
+            T_rel = get_homo_from_pose_rt(R, t)   # c₁ → c₂
+            cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
             tracking_lost = False
 
         world_map.add_pose(cur_pose)        # always push *some* pose
@@ -483,31 +426,20 @@ def main():
 
         # ------------------------------------------------ map growth ------------------------------------------------
         if is_kf:
-            kf_prev, kf_cur = kfs[-2], kfs[-1] 
-            kf_matches = feature_matcher(args, kf_prev.kps, kf_cur.kps, kf_prev.desc, kf_cur.desc, matcher)
-            kf_matches = filter_matches_ransac(kf_prev.kps, kf_cur.kps, kf_matches, args.ransac_thresh)
+            # 1) hand the new KF to the multi-view triangulator
+            mvt.add_keyframe(
+                frame_idx=frame_no,            # global frame number of this KF
+                pose_w_c=cur_pose,
+                kps=kp2,
+                track_map=curr_map,
+                img_bgr=img2)
 
-            # To only triangulate *frame*-level used indices into KF indices
-            used_idx_kf = {m.trainIdx for m in kf_matches if m.trainIdx in used_idx}
+            # 2) try triangulating all tracks that now have ≥3 distinct KFs
+            new_mvt_ids = mvt.triangulate_ready_tracks(world_map)
 
-            # 3) triangulate
-            new_ids = triangulate_new_points(
-                K,
-                pose_prev=kf_prev.pose,             # absolute pose of prev KF
-                pose_cur=cur_pose,                  # absolute pose of current KF
-                kp_prev=kf_prev.kps,
-                kp_cur =kf_cur.kps,
-                matches=kf_matches,
-                used_cur_idx=used_idx_kf,
-                args=args,
-                world_map=world_map,
-                img_cur=img2 # since for a keyframe, img2 is equivalent to kfs[-1].img_bgr
-            )
+            # 3) visualisation hook
+            new_ids = new_mvt_ids                # keeps 3-D viewer in sync
 
-            # 4) register observations
-            for pid, m in zip(new_ids, kf_matches):
-                world_map.points[pid].add_observation(kf_prev.idx, m.queryIdx)
-                world_map.points[pid].add_observation(kf_cur.idx, m.trainIdx)
 
             # pose_prev = cur_pose.copy()
 
@@ -516,12 +448,8 @@ def main():
             #     center_kf_idx=last_kf_idx,
             #     window_size=5 )
 
-
-        # if is_kf and len(world_map.points) > 100:      # light heuristic
-        #     run_bundle_adjustment(world_map, K, frame_keypoints,
-        #                         fix_first_pose=True,
-        #                         max_iters=20)
-
+        p = cur_pose[:3, 3]
+        print(f"Cam position z = {p[2]:.2f}  (should decrease on KITTI)")
 
         # --- 2-D path plot (cheap) ----------------------------------------------
         est_pos = cur_pose[:3, 3]
