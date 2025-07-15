@@ -5,8 +5,20 @@ import glob
 import cv2
 import numpy as np
 import pickle
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import pandas as pd
+
+def _parse_tum_rgb_list(txt_path: str, seq_dir: str) -> Tuple[List[str], List[float]]:
+    """Parse TUM rgb.txt returning (paths, timestamps)."""
+    paths, stamps = [], []
+    with open(txt_path, "r") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            ts_str, rel = line.strip().split()
+            stamps.append(float(ts_str))
+            paths.append(os.path.join(seq_dir, rel))
+    return paths, stamps
 
 def load_sequence(args) -> List[str]:
     """
@@ -100,6 +112,8 @@ def load_calibration(args) -> Dict[str, np.ndarray]:
         return _calib_kitti()
     if args.dataset == 'malaga':
         return _calib_malaga()
+    if args.dataset == "tum-rgbd":
+        return _calib_tum()
     if args.dataset == 'custom':
         calib_path = os.path.join(prefix, 'calibration.pkl')
         return _calib_custom(calib_path)
@@ -136,6 +150,14 @@ def _calib_malaga() -> Dict[str, np.ndarray]:
     # Right camera: assume identity extrinsics for now
     return {'K_l': K_l, 'P_l': P_l, 'K_r': K_l.copy(), 'P_r': P_l.copy()}
 
+def _calib_tum():
+    K = np.array([[517.3, 0., 318.6],
+                  [0., 516.5, 255.3],
+                  [0.,   0.,    1. ]])
+    D = np.array([ 0.2624, -0.9531, 0.0054, 0.0026, -1.1633 ])   # d0-d4
+    P = np.hstack([K, np.zeros((3,1))])
+    return {"K_l": K, "P_l": P, "D_l": D, "K_r":None, "P_r":None, "D_r":None}
+
 
 def _calib_custom(calib_path: str) -> Dict[str, np.ndarray]:
     with open(calib_path, 'rb') as f:
@@ -147,6 +169,40 @@ def _calib_custom(calib_path: str) -> Dict[str, np.ndarray]:
 # --------------------------------------------------------------------------- #
 #  New: ground‐truth loaders
 # --------------------------------------------------------------------------- #
+
+def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Convert unit quaternion to 3×3 rotation matrix (TUM order)."""
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+def _align_tum_gt(rgb_ts: List[float], gt_ts: List[float], poses: List[np.ndarray]) -> List[np.ndarray]:
+    """Align ground‑truth poses to rgb timestamps via nearest‑neighbour search."""
+    aligned = []
+    j = 0
+    for t in rgb_ts:
+        # advance j until gt_ts[j] >= t
+        while j + 1 < len(gt_ts) and gt_ts[j] < t:
+            j += 1
+        # choose closer of j and j‑1
+        if j == 0:
+            aligned.append(poses[0])
+        else:
+            if abs(gt_ts[j] - t) < abs(gt_ts[j - 1] - t):
+                aligned.append(poses[j])
+            else:
+                aligned.append(poses[j - 1])
+    return aligned
+
 
 def load_groundtruth(args) -> Optional[np.ndarray]:
     """
@@ -167,10 +223,36 @@ def load_groundtruth(args) -> Optional[np.ndarray]:
             'malaga-urban-dataset-extract-07_all-sensors_GPS.txt'
         )
         return _malaga_get_gt(filepath, seq)
+    
+    if args.dataset == "tum-rgbd":
+        seq_dir = os.path.join(prefix, "rgbd_dataset_freiburg1_room")
+        rgb_list = os.path.join(seq_dir, "rgb.txt")
+        gt_file = os.path.join(seq_dir, "groundtruth.txt")
 
+        # --- read rgb timestamps --- #
+        _, rgb_ts = _parse_tum_rgb_list(rgb_list, seq_dir)
+
+        # --- read ground‑truth trajectory --- #
+        gt_ts, poses = [], []
+        with open(gt_file, "r") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                items = line.strip().split()
+                ts = float(items[0])
+                tx, ty, tz = map(float, items[1:4])
+                qx, qy, qz, qw = map(float, items[4:8])
+                R = _quat_to_rot(qx, qy, qz, qw)
+                P = np.hstack([R, np.array([[tx], [ty], [tz]], dtype=np.float64)])
+                gt_ts.append(ts)
+                poses.append(P)
+
+        aligned = _align_tum_gt(rgb_ts, gt_ts, poses)
+        return np.stack(aligned, axis=0)  # [N×3×4]
+    
     else:
+        print(f"No ground truth available for dataset: {args.dataset}")
         pass
-    # TODO: add TUM RGB-D parsing here
 
     return None
 

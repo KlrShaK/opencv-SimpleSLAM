@@ -38,7 +38,7 @@ def associate_landmarks(
     pose_w_c:     np.ndarray,
     pts_w:        np.ndarray,      # N×3  (world coords of map)
     kps:          Sequence[cv2.KeyPoint],
-    search_rad:   float = 4.0
+    search_rad:   float = 10.0
 ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """
     Simple projection-based data association:
@@ -83,7 +83,7 @@ def refine_pose_pnp(
     pts3d:    np.ndarray,          # M×3
     pts2d:    np.ndarray           # M×2
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[None, None]:
-    """AP3P + RANSAC → LM-refined (R,t) in world frame."""
+    """AP3P + RANSAC → LM-refined Returns (R, t) that map **world → camera**."""
     if len(pts3d) < 4:
         return None, None
 
