@@ -1,43 +1,44 @@
-"""
-Synthetic‐data unit‑tests for *ba_utils.py*
-===========================================
+# """
+# Synthetic‐data unit‑tests for *ba_utils.py*
+# ===========================================
 
-These tests generate a small 3‑D scene, propagate a pin‑hole camera
-through a known motion, add noise to the **initial** geometry and verify
-that each bundle‑adjustment helper implemented in *ba_utils.py*
+# These tests generate a small 3‑D scene, propagate a pin‑hole camera
+# through a known motion, add optional noise to the **initial** geometry
+# and verify that each bundle‑adjustment helper implemented in
+# *ba_utils.py*
 
-    • two_view_ba
-    • pose_only_ba
-    • local_bundle_adjustment
+#     • two_view_ba
+#     • pose_only_ba
+#     • local_bundle_adjustment
 
-reduces the mean reprojection RMSE.
+# reduces the mean reprojection RMSE.
 
-**Pose convention – T_wc (camera→world)**
-----------------------------------------
-Your SLAM pipeline stores a pose as the rigid-body transform **from the
-camera frame to the world frame**.  To project a world point X_w into a
-camera at T_wc we therefore use
+# **Pose convention – T_wc (camera→world)**
+# ----------------------------------------
+# Your SLAM pipeline stores a pose as the rigid-body transform **from the
+# camera frame to the world frame**.  To project a world point X_w into a
+# camera at T_wc we therefore use
 
-```
-X_c = R_wcᵀ · (X_w − t_wc)
-```
+# ```
+# X_c = R_wcᵀ · (X_w − t_wc)
+# ```
 
-Both the synthetic generator and the RMSE metric below follow that
-convention so that the tests are consistent with run-time code.
+# Both the synthetic generator and the RMSE metric below follow that
+# convention so that the tests are consistent with run-time code.
 
-Requires
---------
-* OpenCV ≥ 4 (for `cv2.KeyPoint`, `cv2.Rodrigues`)
-* `pyceres` + `pycolmap` (same as *ba_utils*)
+# Requires
+# --------
+# * OpenCV ≥ 4 (for `cv2.KeyPoint`, `cv2.Rodrigues`)
+# * `pyceres` + `pycolmap` (same as *ba_utils*)
 
-Run with *pytest* or plain *unittest*:
+# Run with *pytest* or plain *unittest*:
 
-```bash
-python -m pytest test_ba_utils.py     # preferred
-# – or –
-python test_ba_utils.py               # falls back to unittest.main()
-```
-"""
+# ```bash
+# python -m pytest test_ba_utils_fixed.py     # preferred
+# # – or –
+# python test_ba_utils_fixed.py               # falls back to unittest.main()
+# ```
+# """
 
 from __future__ import annotations
 import math
@@ -50,6 +51,7 @@ import numpy as np
 # import the module under test
 import slam.core.ba_utils as bau
 
+# TODO: Create Visualization for points and camera poses
 
 # ------------------------------------------------------------
 # Minimal SLAM‑like data containers understood by ba_utils
@@ -69,6 +71,29 @@ class WorldMap:
     def __init__(self):
         self.poses: List[np.ndarray] = []  # each 4×4 SE(3)
         self.points: Dict[int, MapPoint] = {}  # pid → MapPoint
+
+
+# ------------------------------------------------------------
+# Pose conversion utilities
+# ------------------------------------------------------------
+def T_wc_to_T_cw(T_wc: np.ndarray) -> np.ndarray:
+    """Convert camera-to-world pose to world-to-camera pose."""
+    T_cw = np.eye(4, dtype=np.float64)
+    R_wc = T_wc[:3, :3]
+    t_wc = T_wc[:3, 3]
+    T_cw[:3, :3] = R_wc.T
+    T_cw[:3, 3] = -R_wc.T @ t_wc
+    return T_cw
+
+
+def T_cw_to_T_wc(T_cw: np.ndarray) -> np.ndarray:
+    """Convert world-to-camera pose to camera-to-world pose."""
+    T_wc = np.eye(4, dtype=np.float64)
+    R_cw = T_cw[:3, :3]
+    t_cw = T_cw[:3, 3]
+    T_wc[:3, :3] = R_cw.T
+    T_wc[:3, 3] = -R_cw.T @ t_cw
+    return T_wc
 
 
 # ------------------------------------------------------------
@@ -96,12 +121,24 @@ def generate_scene(
     pose_trans_noise: float = 0.05,
     pose_rot_noise_deg: float = 2.0,
     point_noise: float = 0.05,
+    *,
+    add_noise: bool = True,
 ):
-    """Return *(world_map, keypoints)* with noisy initial estimates.
+    """Return *(world_map, keypoints)* with optional noisy initial estimates.
 
-    *Ground‑truth* is used only to generate noisy **measurements**.  The
-    initial geometry fed to BA is perturbed by *pose_* and *point_noise*.
+    Set *add_noise=False* (or individual *_noise parameters to 0) to
+    create a perfect initialisation that should converge in a single
+    BA iteration.  Ground‑truth is used only to generate measurements –
+    the initial geometry fed to BA is perturbed only when noise is
+    requested.
+    
+    NOTE: This function generates T_wc poses but converts them to T_cw 
+    for storage in world_map to match ba_utils expectations.
     """
+
+    # When add_noise=False force all noise parameters to zero
+    if not add_noise:
+        pix_noise = pose_trans_noise = pose_rot_noise_deg = point_noise = 0.0
 
     rng = np.random.default_rng(42)
 
@@ -114,53 +151,64 @@ def generate_scene(
         )
     )
 
-    # --- ground‑truth camera poses -----------------------------------
-    poses_gt: List[np.ndarray] = []
+    # --- ground‑truth camera poses (camera-to-world T_wc for projection) ---
+    poses_gt_wc: List[np.ndarray] = []
     for i in range(n_frames):
         R = _yaw_to_R(i * yaw_per_frame_deg)
         t = np.array([i * dx_per_frame, 0.0, 0.0], np.float64)
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R
-        T[:3, 3] = t
-        poses_gt.append(T)
+        T_wc = np.eye(4, dtype=np.float64)
+        T_wc[:3, :3] = R
+        T_wc[:3, 3] = t
+        poses_gt_wc.append(T_wc)
 
-    # --- create noisy *initial* map ----------------------------------
+    # --- create (possibly noisy) *initial* map -----------------------
     wmap = WorldMap()
     keypoints: List[List[cv2.KeyPoint]] = [[] for _ in range(n_frames)]
 
-    # a) camera poses
-    for T_gt in poses_gt:
-        # translation noise
+    # a) camera poses --------------------------------------------------
+    for T_wc_gt in poses_gt_wc:
+        # Apply noise to T_wc
         t_noise = rng.normal(0.0, pose_trans_noise, 3)
-        # small random rotation about a random axis
         axis = rng.normal(0.0, 1.0, 3)
         axis /= np.linalg.norm(axis)
         angle = math.radians(pose_rot_noise_deg) * rng.normal()
         R_noise, _ = cv2.Rodrigues(axis * angle)
 
-        T_noisy = np.eye(4, dtype=np.float64)
-        T_noisy[:3, :3] = R_noise @ T_gt[:3, :3]
-        T_noisy[:3, 3] = T_gt[:3, 3] + t_noise
-        wmap.poses.append(T_noisy)
+        T_wc_noisy = np.eye(4, dtype=np.float64)
+        T_wc_noisy[:3, :3] = R_noise @ T_wc_gt[:3, :3]
+        T_wc_noisy[:3, 3] = T_wc_gt[:3, 3] + t_noise
+        
+        # Convert T_wc to T_cw for storage (ba_utils expects T_cw)
+        T_cw_noisy = T_wc_to_T_cw(T_wc_noisy)
+        wmap.poses.append(T_cw_noisy)
 
-    # b) points + observations
+    # b) points + observations ---------------------------------------
     for pid, X_w in enumerate(pts_gt):
         X_init = X_w + rng.normal(0.0, point_noise, 3)
         mp = MapPoint(X_init)
         wmap.points[pid] = mp
 
-        for f_idx, T_wc in enumerate(poses_gt):
-            # project through **ground‑truth** pose to create measurement
-            R, t = T_wc[:3, :3], T_wc[:3, 3]
-            X_c = R @ X_w + t
-            if X_c[2] <= 0:  # behind camera
+        for f_idx, T_wc in enumerate(poses_gt_wc):
+            # Project through **ground‑truth** T_wc pose to create measurement
+            R_wc, t_wc = T_wc[:3, :3], T_wc[:3, 3]
+            X_c = R_wc.T @ (X_w - t_wc)  # world → camera frame
+
+            Z = X_c[2]
+            if Z <= 0:  # behind camera
                 continue
-            u = FX * X_c[0] / X_c[2] + CX
-            v = FY * X_c[1] / X_c[2] + CY
+
+            # Homogeneous pixel coordinates via intrinsics
+            uv_h = K @ X_c
+            u = uv_h[0] / Z
+            v = uv_h[1] / Z
+
             if not (0.0 <= u < WIDTH and 0.0 <= v < HEIGHT):
                 continue
-            # add pixel noise
-            u_meas, v_meas = (u + rng.normal(0.0, pix_noise), v + rng.normal(0.0, pix_noise))
+
+            # add pixel noise (measurement noise, not to the *initial* estimate)
+            u_meas = u + rng.normal(0.0, pix_noise)
+            v_meas = v + rng.normal(0.0, pix_noise)
+
             kp = cv2.KeyPoint(float(u_meas), float(v_meas), 1)
             kp_idx = len(keypoints[f_idx])
             keypoints[f_idx].append(kp)
@@ -174,6 +222,10 @@ def generate_scene(
 # ------------------------------------------------------------
 
 def reproj_rmse(wmap: WorldMap, keypoints, frames: List[int] | None = None) -> float:
+    """
+    Compute reprojection RMSE.
+    wmap.poses are assumed to be T_cw (world-to-camera) as expected by ba_utils.
+    """
     sq_err = 0.0
     count = 0
     frames = set(range(len(keypoints))) if frames is None else set(frames)
@@ -185,13 +237,19 @@ def reproj_rmse(wmap: WorldMap, keypoints, frames: List[int] | None = None) -> f
             kp = keypoints[f_idx][kp_idx]
             u_m, v_m = kp.pt
 
-            T = wmap.poses[f_idx]
-            X = mp.position
-            X_c = T[:3, :3] @ X + T[:3, 3]
-            if X_c[2] <= 0:
+            # wmap.poses[f_idx] is T_cw (world-to-camera)
+            T_cw = wmap.poses[f_idx]
+            X_w = mp.position
+            R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
+            X_c = R_cw @ X_w + t_cw  # world → camera using T_cw
+            
+            Z = X_c[2]
+            if Z <= 0:
                 continue
-            u_p = FX * X_c[0] / X_c[2] + CX
-            v_p = FY * X_c[1] / X_c[2] + CY
+
+            uv_h = K @ X_c
+            u_p = uv_h[0] / Z
+            v_p = uv_h[1] / Z
 
             sq_err += (u_p - u_m) ** 2 + (v_p - v_m) ** 2
             count += 2
@@ -204,25 +262,49 @@ def reproj_rmse(wmap: WorldMap, keypoints, frames: List[int] | None = None) -> f
 # ------------------------------------------------------------
 class TestBundleAdjustment(unittest.TestCase):
     def test_two_view_ba(self):
-        wmap, kps = generate_scene(n_frames=2)
+        wmap, kps = generate_scene(n_frames=2, add_noise=False)
+        e0 = reproj_rmse(wmap, kps)
+        self.assertAlmostEqual(e0, 0.0, places=3, msg="Initial reprojection error should be zero when add_noise=False")
+        bau.two_view_ba(wmap, K, kps, max_iters=30)
+        e1 = reproj_rmse(wmap, kps)
+        self.assertLessEqual(e1, e0 + 1e-9, msg=f"two_view_ba failed: {e0:.6f} → {e1:.6f}")
+
+    def test_two_view_ba_with_noise(self):
+        wmap, kps = generate_scene(n_frames=2, add_noise=True)
         e0 = reproj_rmse(wmap, kps)
         bau.two_view_ba(wmap, K, kps, max_iters=30)
         e1 = reproj_rmse(wmap, kps)
-        self.assertLess(e1, e0, msg=f"two_view_ba failed: {e0:.2f} → {e1:.2f}")
+        self.assertLess(e1, e0, msg=f"two_view_ba failed to reduce error: {e0:.6f} → {e1:.6f}")
 
     def test_pose_only_ba(self):
-        wmap, kps = generate_scene(n_frames=3)
+        wmap, kps = generate_scene(n_frames=3, add_noise=False)
+        e0 = reproj_rmse(wmap, kps, frames=[2])
+        self.assertAlmostEqual(e0, 0.0, places=3)
+        bau.pose_only_ba(wmap, K, kps, frame_idx=2, max_iters=15)
+        e1 = reproj_rmse(wmap, kps, frames=[2])
+        self.assertLessEqual(e1, e0 + 1e-9, msg=f"pose_only_ba failed: {e0:.6f} → {e1:.6f}")
+
+    def test_pose_only_ba_with_noise(self):
+        wmap, kps = generate_scene(n_frames=3, add_noise=True)
         e0 = reproj_rmse(wmap, kps, frames=[2])
         bau.pose_only_ba(wmap, K, kps, frame_idx=2, max_iters=15)
         e1 = reproj_rmse(wmap, kps, frames=[2])
-        self.assertLess(e1, e0, msg=f"pose_only_ba failed: {e0:.2f} → {e1:.2f}")
+        self.assertLess(e1, e0, msg=f"pose_only_ba failed to reduce error: {e0:.6f} → {e1:.6f}")
 
     def test_local_bundle_adjustment(self):
-        wmap, kps = generate_scene(n_frames=10)
+        wmap, kps = generate_scene(n_frames=10, add_noise=False)
+        e0 = reproj_rmse(wmap, kps)
+        self.assertAlmostEqual(e0, 0.0, places=3, msg="Initial reprojection error should be zero when add_noise=False")
+        bau.local_bundle_adjustment(wmap, K, kps, center_kf_idx=9, window_size=8, max_iters=25)
+        e1 = reproj_rmse(wmap, kps)
+        self.assertLessEqual(e1, e0 + 1e-9, msg=f"local_bundle_adjustment failed: {e0:.6f} → {e1:.6f}")
+
+    def test_local_bundle_adjustment_with_noise(self):
+        wmap, kps = generate_scene(n_frames=10, add_noise=True)
         e0 = reproj_rmse(wmap, kps)
         bau.local_bundle_adjustment(wmap, K, kps, center_kf_idx=9, window_size=8, max_iters=25)
         e1 = reproj_rmse(wmap, kps)
-        self.assertLess(e1, e0, msg=f"local_bundle_adjustment failed: {e0:.2f} → {e1:.2f}")
+        self.assertLess(e1, e0, msg=f"local_bundle_adjustment failed to reduce error: {e0:.2f} → {e1:.2f}")
 
 
 if __name__ == "__main__":
