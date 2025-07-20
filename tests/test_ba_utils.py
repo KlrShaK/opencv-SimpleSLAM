@@ -267,6 +267,7 @@ class TestBundleAdjustment(unittest.TestCase):
         self.assertAlmostEqual(e0, 0.0, places=3, msg="Initial reprojection error should be zero when add_noise=False")
         bau.two_view_ba(wmap, K, kps, max_iters=30)
         e1 = reproj_rmse(wmap, kps)
+        print(f"two_view_ba: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLessEqual(e1, e0 + 1e-9, msg=f"two_view_ba failed: {e0:.6f} → {e1:.6f}")
 
     def test_two_view_ba_with_noise(self):
@@ -274,6 +275,7 @@ class TestBundleAdjustment(unittest.TestCase):
         e0 = reproj_rmse(wmap, kps)
         bau.two_view_ba(wmap, K, kps, max_iters=30)
         e1 = reproj_rmse(wmap, kps)
+        print(f"two_view_ba with noise: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLess(e1, e0, msg=f"two_view_ba failed to reduce error: {e0:.6f} → {e1:.6f}")
 
     def test_pose_only_ba(self):
@@ -282,6 +284,7 @@ class TestBundleAdjustment(unittest.TestCase):
         self.assertAlmostEqual(e0, 0.0, places=3)
         bau.pose_only_ba(wmap, K, kps, frame_idx=2, max_iters=15)
         e1 = reproj_rmse(wmap, kps, frames=[2])
+        print(f"pose_only_ba: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLessEqual(e1, e0 + 1e-9, msg=f"pose_only_ba failed: {e0:.6f} → {e1:.6f}")
 
     def test_pose_only_ba_with_noise(self):
@@ -289,6 +292,7 @@ class TestBundleAdjustment(unittest.TestCase):
         e0 = reproj_rmse(wmap, kps, frames=[2])
         bau.pose_only_ba(wmap, K, kps, frame_idx=2, max_iters=15)
         e1 = reproj_rmse(wmap, kps, frames=[2])
+        print(f"pose_only_ba with noise: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLess(e1, e0, msg=f"pose_only_ba failed to reduce error: {e0:.6f} → {e1:.6f}")
 
     def test_local_bundle_adjustment(self):
@@ -297,6 +301,7 @@ class TestBundleAdjustment(unittest.TestCase):
         self.assertAlmostEqual(e0, 0.0, places=3, msg="Initial reprojection error should be zero when add_noise=False")
         bau.local_bundle_adjustment(wmap, K, kps, center_kf_idx=9, window_size=8, max_iters=25)
         e1 = reproj_rmse(wmap, kps)
+        print(f"local_bundle_adjustment: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLessEqual(e1, e0 + 1e-9, msg=f"local_bundle_adjustment failed: {e0:.6f} → {e1:.6f}")
 
     def test_local_bundle_adjustment_with_noise(self):
@@ -304,6 +309,7 @@ class TestBundleAdjustment(unittest.TestCase):
         e0 = reproj_rmse(wmap, kps)
         bau.local_bundle_adjustment(wmap, K, kps, center_kf_idx=9, window_size=8, max_iters=25)
         e1 = reproj_rmse(wmap, kps)
+        print(f"local_bundle_adjustment with noise: e0={e0:.6f}, e1={e1:.6f}")
         self.assertLess(e1, e0, msg=f"local_bundle_adjustment failed to reduce error: {e0:.2f} → {e1:.2f}")
 
 
