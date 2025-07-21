@@ -24,8 +24,27 @@ import math
 from scipy.spatial.transform import Rotation as R
 
 # TODO: USES camera-to-world pose convention T_wc (camera→world) because of PyCERES, REMEMBER TO CONVERT, use below functions
-from slam.core.pose_utils import _pose_inverse, _pose_to_quat_trans, _quat_trans_to_pose
+# from slam.core.pose_utils import _pose_inverse, _pose_to_quat_trans, _quat_trans_to_pose
 
+# TODO : UNCOMMENT IF YOU USE T_cw (camera-from-world) convention
+from slam.core.pose_utils import (
+    _pose_inverse,           # T ↔ T⁻¹
+    _pose_to_quat_trans as _cw_to_quat_trans,
+    _quat_trans_to_pose as _quat_trans_to_cw,
+)
+def _pose_to_quat_trans(T_wc):
+    """
+    Convert **camera→world** pose T_wc to the (q_cw, t_cw) parameterisation
+    expected by COLMAP/pyceres residuals.
+    """
+    return _cw_to_quat_trans(_pose_inverse(T_wc))
+
+
+def _quat_trans_to_pose(q_cw, t_cw):
+    """
+    Convert optimised (q_cw, t_cw) back to a **camera→world** SE3 matrix.
+    """
+    return _pose_inverse(_quat_trans_to_cw(q_cw, t_cw))
 
 # --------------------------------------------------------------------- #
 #  Shared helper to add one reprojection residual
