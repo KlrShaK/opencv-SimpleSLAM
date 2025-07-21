@@ -47,7 +47,7 @@ class Map:
 
     def __init__(self) -> None:
         self.points: Dict[int, MapPoint] = {}
-        self.poses: List[np.ndarray] = []  # List of 4×4 camera‑to‑world matrices
+        self.poses: List[np.ndarray] = []  # List of 4×4 camera‑to‑world matrices (World-from-Camera)
         self._next_pid: int = 0
 
     # ---------------- Camera trajectory ---------------- #
@@ -145,29 +145,6 @@ class Map:
 
         for idx in removed:
             self.points.pop(idx, None)
-
-
-    def align_points_to_map(self, pts: np.ndarray, radius: float = 0.05) -> np.ndarray:
-        """Rigidly align ``pts`` to existing landmarks using nearest neighbours."""
-        map_pts = self.get_point_array()
-        if len(map_pts) < 3 or len(pts) < 3:
-            return pts
-
-        tree = cKDTree(map_pts)
-        src, dst = [], []
-        for p in pts:
-            idxs = tree.query_ball_point(p, radius)
-            if idxs:
-                src.append(p)
-                dst.append(map_pts[idxs[0]])
-
-        if len(src) < 3:
-            return pts
-
-        from .pnp_utils import align_point_clouds
-        R, t = align_point_clouds(np.asarray(src), np.asarray(dst))
-        pts_aligned = (R @ pts.T + t[:, None]).T
-        return pts_aligned
 
 
 # --------------------------------------------------------------------------- #

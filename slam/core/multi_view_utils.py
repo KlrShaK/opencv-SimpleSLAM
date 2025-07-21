@@ -46,7 +46,7 @@ def multi_view_triangulation(
     for T_w_c, (u, v) in zip(poses_w_c, pts2d):
         pc = (_pose_inverse(T_w_c) @ np.append(X, 1.0))[:3]  
         if pc[2] <= 0:                             # behind the camera
-            print("Cheirality check failed:", pc)
+            # print("Cheirality check failed:", pc)
             return None
         depths.append(pc[2])
 
@@ -54,12 +54,12 @@ def multi_view_triangulation(
         reproj.append(np.linalg.norm(uv_hat - (u, v)))
 
     if not (min_depth <= np.mean(depths) <= max_depth):
-        print(f"Depth check failed: {np.mean(depths)} not in [{min_depth}, {max_depth}]")
+        # print(f"Depth check failed: {np.mean(depths)} not in [{min_depth}, {max_depth}]")
         return None
     if np.mean(reproj) > max_rep_err:
-        print(f"Reprojection error check failed: {np.mean(reproj)} > {max_rep_err}")
+        # print(f"Reprojection error check failed: {np.mean(reproj)} > {max_rep_err}")
         return None
-    print(f"ONE Triangulated point: {X} (depths: {depths}, reproj: {reproj})")
+    # print(f"ONE Triangulated point: {X} (depths: {depths}, reproj: {reproj})")
     return X
 
 
@@ -157,7 +157,6 @@ class MultiViewTriangulator:
                         break
 
                 # --------------- map insertion (+ optional merging) -------------
-                X = world_map.align_points_to_map(X[None, :], radius=self.merge_radius)[0]
                 pid = world_map.add_points(X[None, :], np.float32([[*rgb]]))[0]
                 for o in obs_sorted:
                     world_map.points[pid].add_observation(o.kf_idx, o.kp_idx)
