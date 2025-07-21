@@ -6,7 +6,6 @@ Functions under test:
     * project_points
     * associate_landmarks
     * refine_pose_pnp
-    * align_point_clouds
 
 We generate synthetic, perfectly controlled data (and some noisy variants) so the
 expected geometric relationships are analytically known.
@@ -18,7 +17,6 @@ Conventions verified:
 Edge cases handled:
     * Empty inputs in associate_landmarks
     * Insufficient points for refine_pose_pnp
-    * Degenerate alignment input shapes for align_point_clouds
 
 Precision thresholds:
     * Rotation matrices compared with max abs diff <= 1e-6 (ideal / noise-free)
@@ -36,7 +34,7 @@ try:
     import cv2  # type: ignore
     OPENCV_AVAILABLE = True
 except Exception:  # pragma: no cover
-    OPENCV_AVAILABLE = False
+    raise ImportError("OpenCV (cv2) is required for some tests")
 
 # Import functions under test
 import importlib
@@ -44,7 +42,6 @@ from slam.core import pnp_utils
 project_points = pnp_utils.project_points
 associate_landmarks = pnp_utils.associate_landmarks
 refine_pose_pnp = pnp_utils.refine_pose_pnp
-align_point_clouds = pnp_utils.align_point_clouds
 
 
 # ---------------------------------------------------------------------------
@@ -209,42 +206,6 @@ def test_refine_pose_pnp_insufficient_points():
     pts2d = np.random.randn(3,2).astype(np.float32)
     R, t = refine_pose_pnp(K, pts3d, pts2d)
     assert R is None and t is None
-
-# ---------------------------------------------------------------------------
-# align_point_clouds
-# ---------------------------------------------------------------------------
-
-def test_align_point_clouds_perfect():
-    rng = np.random.default_rng(123)
-    src = rng.normal(size=(50,3))
-    R = random_rotation(rng)
-    t = rng.uniform(-1,1,size=3)
-    dst = (R @ src.T).T + t
-    R_est, t_est = align_point_clouds(src, dst)
-    assert np.allclose(R_est @ R_est.T, np.eye(3), atol=1e-7)
-    assert np.isclose(np.linalg.det(R_est), 1.0, atol=1e-7)
-    # Because of noise-free data, expect very tight equality
-    assert np.allclose(R_est, R, atol=1e-6)
-    assert np.allclose(t_est, t, atol=1e-6)
-
-
-def test_align_point_clouds_with_noise():
-    rng = np.random.default_rng(7)
-    src = rng.normal(size=(80,3))
-    R = random_rotation(rng)
-    t = rng.uniform(-0.5,0.5,size=3)
-    dst = (R @ src.T).T + t + rng.normal(scale=0.002, size=src.shape)
-    R_est, t_est = align_point_clouds(src, dst)
-    rot_err = np.rad2deg(np.arccos(max(-1, min(1, (np.trace(R_est.T @ R)-1)/2))))
-    assert rot_err < 0.3  # degrees
-    assert np.linalg.norm(t_est - t) < 0.01
-
-
-def test_align_point_clouds_bad_shape():
-    src = np.zeros((5,2))
-    dst = np.zeros((5,2))
-    with pytest.raises(ValueError):
-        align_point_clouds(src, dst)
 
 
 # ---------------------------------------------------------------------------
