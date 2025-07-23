@@ -117,9 +117,9 @@ class MultiViewTriangulator:
 
         for kp_idx, tid in track_map.items():
             u, v = kps[kp_idx].pt
-            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), desc.copy()) )
             desc = descriptors[kp_idx] if descriptors is not None else default_desc
             self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), desc.copy()))
+
 
 
     # ------------------------------------------------------------------ #
