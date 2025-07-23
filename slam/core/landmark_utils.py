@@ -27,16 +27,33 @@ from scipy.spatial import cKDTree
 # --------------------------------------------------------------------------- #
 @dataclass
 class MapPoint:
-    """A single triangulated 3‑D landmark."""
+    """A single triangulated 3‑D landmark.
+
+    Parameters
+    ----------
+    id
+        Unique landmark identifier.
+    position
+        3‑D position in world coordinates (shape ``(3,)``).
+    keyframe_idx
+        Index of the keyframe that first observed / created this landmark.
+    colour
+        RGB colour (linear, 0‑1) associated with the point (shape ``(3,)``).
+    observations
+        List of observations in the form ``(frame_idx, kp_idx, descriptor)`` where
+        * ``frame_idx`` – index of the frame where the keypoint was detected.
+        * ``kp_idx``    – index of the keypoint inside that frame.
+        * ``descriptor`` – feature descriptor as a 1‑D ``np.ndarray``.
+    """
     id: int
     position: np.ndarray  # shape (3,)
     keyframe_idx: int = -1
     colour: np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
-    observations: List[Tuple[int, int]] = field(default_factory=list)  # (frame_idx, kp_idx)
+    observations: List[Tuple[int, int, np.ndarray]] = field(default_factory=list)  # (frame_idx, kp_idx, descriptor)
 
-    def add_observation(self, frame_idx: int, kp_idx: int) -> None:
+    def add_observation(self, frame_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
         """Register that *kp_idx* in *frame_idx* observes this landmark."""
-        self.observations.append((frame_idx, kp_idx))
+        self.observations.append((frame_idx, kp_idx, descriptor))
 
 
 # --------------------------------------------------------------------------- #

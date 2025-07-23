@@ -71,6 +71,7 @@ class _Obs:
     kf_idx: int
     kp_idx: int
     uv: Tuple[float, float]
+    descriptor: np.ndarray
 
 
 class MultiViewTriangulator:
@@ -106,13 +107,20 @@ class MultiViewTriangulator:
                      Twc_pose: np.ndarray,
                      kps: List,                       # List[cv2.KeyPoint]
                      track_map: Dict[int, int],
-                     img_bgr: np.ndarray) -> None:
+                     img_bgr: np.ndarray,
+                     descriptors: Optional[List[np.ndarray]]) -> None:
+
         """Register observations (and keep the *full-res* image for colour sampling)."""
         self._kf_poses[frame_idx] = Twc_pose.copy()
         self._kf_imgs[frame_idx]  = img_bgr            # shallow copy is fine
+        default_desc = np.zeros(32, dtype=np.uint8)
+
         for kp_idx, tid in track_map.items():
             u, v = kps[kp_idx].pt
-            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v)))
+            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), desc.copy()) )
+            desc = descriptors[kp_idx] if descriptors is not None else default_desc
+            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), desc.copy()))
+
 
     # ------------------------------------------------------------------ #
     def triangulate_ready_tracks(self, world_map: Map) -> List[int]:
@@ -159,7 +167,7 @@ class MultiViewTriangulator:
                 # --------------- map insertion (+ optional merging) -------------
                 pid = world_map.add_points(X[None, :], np.float32([[*rgb]]))[0]
                 for o in obs_sorted:
-                    world_map.points[pid].add_observation(o.kf_idx, o.kp_idx)
+                    world_map.points[pid].add_observation(o.kf_idx, o.kp_idx, o.descriptor)
 
                 new_ids.append(pid)
                 self._triangulated.add(tid)
