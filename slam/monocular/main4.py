@@ -1,6 +1,6 @@
 # main.py
 """
-WITHOUT MULTI-VIEW TRIANGULATION - Use 2 different stratergy for motion estimation
+WITH MULTI-VIEW TRIANGULATION - Use 2 different stratergy for motion estimation
 
 Entry-point: high-level processing loop
 --------------------------------------
@@ -25,6 +25,8 @@ import numpy as np
 from tqdm import tqdm
 from typing import List
 
+from slam.core.pose_utils import _pose_inverse, _pose_rt_to_homogenous
+
 from slam.core.dataloader import (
                             load_sequence, 
                             load_frame_pair, 
@@ -48,7 +50,6 @@ from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map, triangulate_points
 from slam.core.multi_view_utils import MultiViewTriangulator
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
-from slam.core.ba_utils_OG import run_bundle_adjustment
 from slam.core.ba_utils import (
     two_view_ba,
     pose_only_ba,
@@ -102,23 +103,6 @@ def _build_parser() -> argparse.ArgumentParser:
 #  Helper functions
 # --------------------------------------------------------------------------- #
 
-def _pose_inv(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Return 4×4 inverse of a rigid‑body transform specified by R|t."""
-    Rt = R.T
-    tinv = -Rt @ t
-    T = np.eye(4)
-    T[:3, :3] = Rt
-    T[:3, 3] = tinv.ravel()
-    return T
-
-def get_homo_from_pose_rt(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Homogeneous matrix  **T_c1→c2**  from the relative pose (R, t)
-       returned by `recoverPose`."""
-    T = np.eye(4)
-    T[:3, :3]  = R
-    T[:3, 3]   = t.ravel()
-    return T
-
 def try_bootstrap(K, kp0, kp1, matches, args, world_map):
     """Return (success, T_cam0_w, T_cam1_w) and add initial landmarks."""
     if len(matches) < 50:
@@ -154,20 +138,25 @@ def try_bootstrap(K, kp0, kp1, matches, args, world_map):
     p0 = pts0[mask]
     p1 = pts1[mask]
     pts3d = triangulate_points(K, R, t, p0, p1)
-    z = pts3d[:, 2]
-    # print(z, "mean depth:", np.mean(z))
-    ok = (z > args.min_depth) & (z < args.max_depth)
+
+    z0 = pts3d[:, 2]
+    pts3d_cam1 = (R @ pts3d.T + t.reshape(3, 1)).T
+    z1 = pts3d_cam1[:, 2]
+
+    # both cameras see the point in front of them
+    ok = ( (z0 > args.min_depth) & (z0 < args.max_depth) &     # in front of cam‑0
+    (z1 > args.min_depth) & (z1 < args.max_depth) )       # in front of cam‑1)
     pts3d = pts3d[ok]
+    print(f"[BOOTSTRAP] Triangulated {len(pts3d)} points. Status: {ok.sum()} inliers")
 
     if len(pts3d) < 80:
+        print("[BOOTSTRAP] Not enough points to bootstrap the map.")
         return False, None, None
 
+    T1_cw = _pose_rt_to_homogenous(R, t) # camera-from-world
+    T1_wc = _pose_inverse(T1_cw)    # world-from-camera
     # 3. fill the map
-    T1_w = np.eye(4)
-    T1_w[:3, :3] = R.T
-    T1_w[:3, 3]  = (-R.T @ t).ravel()
-
-    world_map.add_pose(T1_w)
+    world_map.add_pose(T1_wc)
 
     cols = np.full((len(pts3d), 3), 0.7)   # grey – colour is optional here
     ids = world_map.add_points(pts3d, cols, keyframe_idx=1)
@@ -182,10 +171,10 @@ def try_bootstrap(K, kp0, kp1, matches, args, world_map):
 
 
     print(f"[BOOTSTRAP] Map initialised with {len(ids)} landmarks.")
-    return True, T1_w
+    return True, T1_wc
 
 
-def solve_pnp_step(K, pose_pred, world_map, kp, args):
+def solve_pnp_step(K, pose_pred, world_map, kp, args, ):
     """Return (success, refined_pose, used_kp_indices)."""
     pts_w = world_map.get_point_array()
     pts3d, pts2d, used = associate_landmarks(
@@ -198,14 +187,12 @@ def solve_pnp_step(K, pose_pred, world_map, kp, args):
     if R is None:
         return False, pose_pred, used
 
-    R_wc = R.T
-    t_wc = -R.T @ t
-    pose_w_c = np.eye(4, dtype=np.float32)
-    pose_w_c[:3,:3] = R_wc
-    pose_w_c[:3, 3] = t_wc
+    # TODO:  :Look at the POSE HERE, ERROR is something related to this only
+    T_cw = _pose_rt_to_homogenous(R, t)
+    T_wc = _pose_inverse(T_cw)
 
     print(f"[PNP] Pose refined with {len(pts3d)} inliers.")
-    return True, pose_w_c, used
+    return True, T_wc, used
 
 
 def triangulate_new_points(K, pose_prev, pose_cur,
@@ -221,8 +208,7 @@ def triangulate_new_points(K, pose_prev, pose_cur,
     p1 = np.float32([kp_cur[m.trainIdx].pt  for m in fresh])
 
     # -- baseline / parallax test (ORB-SLAM uses θ ≈ 1°)
-    # rel = np.linalg.inv(pose_prev) @ pose_cur
-    rel = np.linalg.inv(pose_cur) @ pose_prev  # c₂ → c₁
+    rel = _pose_inverse(pose_cur) @ pose_prev  # c₂ → c₁
     R_rel, t_rel = rel[:3, :3], rel[:3, 3]
     cos_thresh = np.cos(np.deg2rad(1.0))
 
@@ -296,7 +282,7 @@ def main():
 
     mvt = MultiViewTriangulator(
         K,
-        min_views=3,                             # ← “every 3 key-frames”
+        min_views=2,                             # ← “every 3 key-frames”
         merge_radius=args.merge_radius,
         max_rep_err=args.mvt_rep_err,
         min_depth=args.min_depth,
@@ -310,8 +296,8 @@ def main():
 
 
     world_map = Map()
-    cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
-    world_map.add_pose(cur_pose) #TODO CODE IS INITIALIZING SOMEWHERE ELSE IN BOOTSTRAP CHECK IT --ANSWER in try bootstrap 
+    Twc_cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
+    world_map.add_pose(Twc_cur_pose)
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
     plot2d = TrajectoryPlotter()           
 
@@ -359,7 +345,7 @@ def main():
         frame_keypoints.append(kp2)
         if i == 0:
             kfs.append(Keyframe(0, seq[0] if isinstance(seq[0], str) else "",
-                        kp1, des1, cur_pose, make_thumb(img1, tuple(args.kf_thumb_hw))))
+                        kp1, des1, Twc_cur_pose, make_thumb(img1, tuple(args.kf_thumb_hw))))
             last_kf_idx = 0
             prev_len = len(kfs)
             is_kf = False
@@ -367,7 +353,7 @@ def main():
         else:
             prev_len = len(kfs)
             kfs, last_kf_idx = select_keyframe(
-                args, seq, i, img2, kp2, des2, cur_pose, matcher, kfs, last_kf_idx)
+                args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_idx)
             is_kf = len(kfs) > prev_len
 
         print("len(kfs) = ", len(kfs), "last_kf_idx = ", last_kf_idx)
@@ -377,7 +363,7 @@ def main():
                 continue 
             bootstrap_matches = feature_matcher(args, kfs[0].kps, kfs[-1].kps, kfs[0].desc, kfs[-1].desc, matcher)
             bootstrap_matches = filter_matches_ransac(kfs[0].kps, kfs[-1].kps, bootstrap_matches, args.ransac_thresh)
-            ok, temp_pose = try_bootstrap(K, kfs[0].kps, kfs[-1].kps, bootstrap_matches, args, world_map)
+            ok, Twc_temp_pose = try_bootstrap(K, kfs[0].kps, kfs[-1].kps, bootstrap_matches, args, world_map)
             if ok:
                 frame_keypoints[0] = kfs[0].kps        # BA (img1 is frame-0)
                 frame_keypoints[-1] = kfs[-1].kps        # BA (img2 is frame-1)
@@ -385,16 +371,16 @@ def main():
                 # two_view_ba(world_map, K, frame_keypoints, max_iters=25) # BA
 
                 initialised = True
-                cur_pose = world_map.poses[-1].copy()               # we are at frame i+1
+                Twc_cur_pose = world_map.poses[-1].copy()               # we are at frame i+1
                 continue
             else:
                 print("******************BOOTSTRAP FAILED**************")
                 continue           # keep trying with next frame
 
         # ------------------------------------------------ tracking -------------------------------------------------
-        pose_pred = cur_pose.copy()         # CV-predict could go here
-        ok_pnp, cur_pose, used_idx = solve_pnp_step(
-            K, pose_pred, world_map, kp2, args) # last keyframe
+        Twc_pose_pred = Twc_cur_pose.copy()         
+        ok_pnp, Twc_cur_pose, used_idx = solve_pnp_step(
+            K, Twc_pose_pred, world_map, kp2, args) # kp2 is the current frame keypoints
 
         if not ok_pnp:                      # fallback to 2-D-2-D if PnP failed
             print(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
@@ -415,21 +401,21 @@ def main():
                 tracking_lost = True
                 continue
             _, R, t, mpose = cv2.recoverPose(E, pts0, pts1, K)
-            T_rel = get_homo_from_pose_rt(R, t)   # c₁ → c₂
-            cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
+            T_rel = _pose_rt_to_homogenous(R, t)   # c₁ → c₂
+            Twc_cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
             tracking_lost = False
 
-        world_map.add_pose(cur_pose)        # always push *some* pose
+        world_map.add_pose(Twc_cur_pose)        # always push *some* pose
 
         # pose_only_ba(world_map, K, frame_keypoints,    # FOR BA
-        #      frame_idx=len(world_map.poses)-1)
+            #  frame_idx=len(world_map.poses)-1)
 
         # ------------------------------------------------ map growth ------------------------------------------------
         if is_kf:
             # 1) hand the new KF to the multi-view triangulator
             mvt.add_keyframe(
                 frame_idx=frame_no,            # global frame number of this KF
-                pose_w_c=cur_pose,
+                Twc_pose=Twc_cur_pose,
                 kps=kp2,
                 track_map=curr_map,
                 img_bgr=img2)
@@ -446,13 +432,14 @@ def main():
             # local_bundle_adjustment(
             #     world_map, K, frame_keypoints,
             #     center_kf_idx=last_kf_idx,
-            #     window_size=5 )
+            #     window_size=8 )
 
-        p = cur_pose[:3, 3]
-        print(f"Cam position z = {p[2]:.2f}  (should decrease on KITTI)")
+        p = Twc_cur_pose[:3, 3]
+        p_gt = gt_T[i + 1, :3, 3]
+        print(f"Cam position z = {p}, GT = {p_gt}  (should decrease on KITTI)")
 
         # --- 2-D path plot (cheap) ----------------------------------------------
-        est_pos = cur_pose[:3, 3]
+        est_pos = Twc_cur_pose[:3, 3]
         gt_pos  = None
         if gt_T is not None and i + 1 < len(gt_T):
             p_gt = gt_T[i + 1, :3, 3]                     # raw GT
