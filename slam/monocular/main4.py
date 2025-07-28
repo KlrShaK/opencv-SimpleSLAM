@@ -1,6 +1,6 @@
 # main.py
 """
-WITH MULTI-VIEW TRIANGULATION - Use 2 different stratergy for motion estimation
+WITH MULTI-VIEW TRIANGULATION - New PnP
 
 Entry-point: high-level processing loop
 --------------------------------------
@@ -103,7 +103,7 @@ def _build_parser() -> argparse.ArgumentParser:
 #  Helper functions
 # --------------------------------------------------------------------------- #
 
-def try_bootstrap(K, kp0, kp1, matches, args, world_map):
+def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     """Return (success, T_cam0_w, T_cam1_w) and add initial landmarks."""
     if len(matches) < 50:
         return False, None, None
@@ -166,8 +166,8 @@ def try_bootstrap(K, kp0, kp1, matches, args, world_map):
     # -----------------------------------------------
     inlier_kp_idx = np.where(mask)[0][ok]   # kp indices that survived depth
     for pid, kp_idx in zip(ids, inlier_kp_idx):
-        world_map.points[pid].add_observation(0, kp_idx)   # img0 side
-        world_map.points[pid].add_observation(1, kp_idx)   # img1 side
+        world_map.points[pid].add_observation(0, kp_idx, descs0[kp_idx])   # img0 side
+        world_map.points[pid].add_observation(1, kp_idx, descs1[kp_idx])   # img1 side
 
 
     print(f"[BOOTSTRAP] Map initialised with {len(ids)} landmarks.")
@@ -193,6 +193,84 @@ def solve_pnp_step(K, pose_pred, world_map, kp, args, ):
 
     print(f"[PNP] Pose refined with {len(pts3d)} inliers.")
     return True, T_wc, used
+
+# --------------------------------------------------------------------------- #
+#  Continuous pose tracking (PnP)
+# --------------------------------------------------------------------------- #
+def track_with_pnp(K,
+                   kp_prev, kp_cur, desc_prev, desc_cur, matches,
+                   frame_no,                    # global index of *current* frame
+                   Twc_prev,                    # pose for frame_no-1 (4×4)
+                   world_map, args):
+    """
+    Estimate T_wc for *current* frame using Perspective-n-Point.
+
+    Returns
+    -------
+    ok : bool
+    Twc_cur : (4,4) np.ndarray – pose camera-to-world for frame `frame_no`
+    used_cur_idx : set[int]    – kp indices on the current image that were
+                                  part of the inlier PnP solution.  These are
+                                  excluded from later triangulation.
+    """
+    # ----------------------------------------------------------
+    # 1) Gather 2-D/3-D correspondences            (X_w , u_v)
+    # ----------------------------------------------------------
+    obj_pts, img_pts, obj_pids, kp_cur_ids = [], [], [], []
+    prev_frame = frame_no - 1
+
+    for m in matches:
+        kp_prev_idx = m.queryIdx          # key-point index in previous frame
+        kp_cur_idx  = m.trainIdx          # key-point index in current frame
+
+        # See whether that previous key-point is an observation of a landmark
+        for pid, mp in world_map.points.items():
+            # mp.observations is a list of (frame_idx, kp_idx)
+            if any(f == prev_frame and k == kp_prev_idx for f, k, _ in mp.observations):
+                obj_pts.append(mp.position)          # ← 3-D point (world)
+                img_pts.append(kp_cur[kp_cur_idx].pt) # ← 2-D measurement
+                obj_pids.append(pid)
+                kp_cur_ids.append(kp_cur_idx)
+                break
+
+    if len(obj_pts) < args.pnp_min_inliers:
+        print(f"[PNP]  Not enough 2-D/3-D pairs: {len(obj_pts)} < {args.pnp_min_inliers}")
+        return False, None, set()
+
+    obj_pts = np.ascontiguousarray(obj_pts, dtype=np.float32)
+    img_pts = np.ascontiguousarray(img_pts, dtype=np.float32)
+
+    # ----------------------------------------------------------
+    # 2) PnP + RANSAC
+    # ----------------------------------------------------------
+    ok, rvec, tvec, inl = cv2.solvePnPRansac(
+        obj_pts, img_pts, K, None,
+        iterationsCount=100,
+        reprojectionError=args.ransac_thresh,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_EPNP)
+
+    if not ok or inl is None or len(inl) < args.pnp_min_inliers:
+        print(f"[PNP]  RANSAC failed – only {0 if inl is None else len(inl)} inliers")
+        return False, None, set()
+
+    # camera-from-world  →  world-from-camera
+    R, _ = cv2.Rodrigues(rvec)
+    T_cw = _pose_rt_to_homogenous(R, tvec)
+    Twc_cur = _pose_inverse(T_cw)
+
+    # ----------------------------------------------------------
+    # 3) Register new 2-D observation for every inlier landmark
+    # ----------------------------------------------------------
+    inl = inl.ravel()
+    for arr_idx, pid in enumerate(obj_pids):
+        if arr_idx in inl:                    # inlier test
+            kp_idx = kp_cur_ids[arr_idx]
+            world_map.points[pid].add_observation(frame_no, kp_idx, desc_cur[kp_idx])
+
+    used_cur_idx = {kp_cur_ids[i] for i in inl}
+    print(f"[PNP]  Pose @ frame {frame_no} refined with {len(inl)} inliers")
+    return True, Twc_cur, used_cur_idx
 
 
 def triangulate_new_points(K, pose_prev, pose_cur,
@@ -360,10 +438,10 @@ def main():
         # ------------------------------------------------ bootstrap ------------------------------------------------ # TODO FIND A BETTER WAY TO manage index
         if not initialised:
             if len(kfs) < 2:
-                continue 
+                continue
             bootstrap_matches = feature_matcher(args, kfs[0].kps, kfs[-1].kps, kfs[0].desc, kfs[-1].desc, matcher)
             bootstrap_matches = filter_matches_ransac(kfs[0].kps, kfs[-1].kps, bootstrap_matches, args.ransac_thresh)
-            ok, Twc_temp_pose = try_bootstrap(K, kfs[0].kps, kfs[-1].kps, bootstrap_matches, args, world_map)
+            ok, Twc_temp_pose = try_bootstrap(K, kfs[0].kps, kfs[0].desc, kfs[-1].kps, kfs[-1].desc, bootstrap_matches, args, world_map)
             if ok:
                 frame_keypoints[0] = kfs[0].kps        # BA (img1 is frame-0)
                 frame_keypoints[-1] = kfs[-1].kps        # BA (img2 is frame-1)
@@ -379,8 +457,14 @@ def main():
 
         # ------------------------------------------------ tracking -------------------------------------------------
         Twc_pose_pred = Twc_cur_pose.copy()         
-        ok_pnp, Twc_cur_pose, used_idx = solve_pnp_step(
-            K, Twc_pose_pred, world_map, kp2, args) # kp2 is the current frame keypoints
+        # ok_pnp, Twc_cur_pose, used_idx = solve_pnp_step(
+        #     K, Twc_pose_pred, world_map, kp2, args) # kp2 is the current frame keypoints
+        ok_pnp, Twc_cur_pose, used_idx = track_with_pnp(K, kp1, kp2, des1, des2, matches,
+                                                        frame_no=i + 1,
+                                                        Twc_prev=Twc_cur_pose,        # pose from the *previous* iteration
+                                                        world_map=world_map,
+                                                        args=args)
+        
 
         if not ok_pnp:                      # fallback to 2-D-2-D if PnP failed
             print(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
@@ -418,7 +502,8 @@ def main():
                 Twc_pose=Twc_cur_pose,
                 kps=kp2,
                 track_map=curr_map,
-                img_bgr=img2)
+                img_bgr=img2,
+                descriptors=des2)               # new key-frame
 
             # 2) try triangulating all tracks that now have ≥3 distinct KFs
             new_mvt_ids = mvt.triangulate_ready_tracks(world_map)
