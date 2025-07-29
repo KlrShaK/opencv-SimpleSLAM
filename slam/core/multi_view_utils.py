@@ -118,8 +118,8 @@ class MultiViewTriangulator:
         for kp_idx, tid in track_map.items():
             u, v = kps[kp_idx].pt
             desc = descriptors[kp_idx] if descriptors is not None else default_desc
-            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), desc.copy()))
-
+            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc.cpu()).copy()))
+# TODO: CHECK HERE WHY IS DESCRITOR A TENSOR
 
 
     # ------------------------------------------------------------------ #
@@ -147,7 +147,6 @@ class MultiViewTriangulator:
                     max_depth=self.max_depth,
                     max_rep_err=self.max_rep_err,
                 )
-                # print(" Triangulated 3D point:", X)
                 if X is None:
                     continue
 
@@ -172,5 +171,8 @@ class MultiViewTriangulator:
                 new_ids.append(pid)
                 self._triangulated.add(tid)
                 self._track_obs.pop(tid, None)           # free memory
+
+        if new_ids:
+            print(f"[TRIANGULATION] Added {len(new_ids)} new point(s) to the map")
 
         return new_ids
