@@ -13,7 +13,7 @@
 
 # reduces the mean reprojection RMSE.
 
-# **Pose convention – T_wc (camera→world)**
+# **Pose convention – T_cw (camera-from-world)(world→camera)**
 # ----------------------------------------
 # Your SLAM pipeline stores a pose as the rigid-body transform **from the
 # camera frame to the world frame**.  To project a world point X_w into a
@@ -62,7 +62,7 @@ class MapPoint:
     def __init__(self, position: np.ndarray):
         self.position: np.ndarray = position.astype(np.float64)
         # list[(frame_idx, kp_idx)]
-        self.observations: List[Tuple[int, int]] = []
+        self.observations: List[Tuple[int, int, np.ndarray]] = []
 
 
 class WorldMap:
@@ -76,6 +76,7 @@ class WorldMap:
 # ------------------------------------------------------------
 # Pose conversion utilities
 # ------------------------------------------------------------
+# TODO: Code duplication with slam/core/pose_utils.py, refactor
 def T_wc_to_T_cw(T_wc: np.ndarray) -> np.ndarray:
     """Convert camera-to-world pose to world-to-camera pose."""
     T_cw = np.eye(4, dtype=np.float64)
@@ -212,7 +213,7 @@ def generate_scene(
             kp = cv2.KeyPoint(float(u_meas), float(v_meas), 1)
             kp_idx = len(keypoints[f_idx])
             keypoints[f_idx].append(kp)
-            mp.observations.append((f_idx, kp_idx))
+            mp.observations.append((f_idx, kp_idx, np.random.rand(128)))  # dummy descriptor
 
     return wmap, keypoints
 
@@ -231,7 +232,7 @@ def reproj_rmse(wmap: WorldMap, keypoints, frames: List[int] | None = None) -> f
     frames = set(range(len(keypoints))) if frames is None else set(frames)
 
     for mp in wmap.points.values():
-        for f_idx, kp_idx in mp.observations:
+        for f_idx, kp_idx, descriptor in mp.observations:
             if f_idx not in frames:
                 continue
             kp = keypoints[f_idx][kp_idx]

@@ -13,7 +13,7 @@
 
 # reduces the mean reprojection RMSE.
 
-# **Pose convention – T_wc (camera→world)**
+# **Pose convention – T_wc (world-from-camera)(camera→world)**
 # ----------------------------------------
 # Your SLAM pipeline stores a pose as the rigid-body transform **from the
 # camera frame to the world frame**.  To project a world point X_w into a
@@ -213,7 +213,7 @@ def generate_scene(
             kp = cv2.KeyPoint(float(u_meas), float(v_meas), 1)
             kp_idx = len(keypoints[f_idx])
             keypoints[f_idx].append(kp)
-            mp.observations.append((f_idx, kp_idx))
+            mp.observations.append((f_idx, kp_idx, np.random.rand(128)))
 
     return wmap, keypoints
 
@@ -232,7 +232,7 @@ def reproj_rmse(wmap: WorldMap, keypoints, frames: List[int] | None = None) -> f
     frames = set(range(len(keypoints))) if frames is None else set(frames)
 
     for mp in wmap.points.values():
-        for f_idx, kp_idx in mp.observations:
+        for f_idx, kp_idx, descriptors in mp.observations:
             if f_idx not in frames:
                 continue
             kp = keypoints[f_idx][kp_idx]
