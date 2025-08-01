@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug SLAM Monocular",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "slam.monocular.main",
+      "args": [
+        "--dataset", "kitti",
+        "--base_dir", "./Dataset",
+        "--use_lightglue",
+        "--ransac_thresh", "1.0"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
