@@ -118,7 +118,10 @@ class MultiViewTriangulator:
         for kp_idx, tid in track_map.items():
             u, v = kps[kp_idx].pt
             desc = descriptors[kp_idx] if descriptors is not None else default_desc
-            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc.cpu()).copy()))
+            try:
+                self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc).copy()))
+            except:
+                self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc.cpu()).copy()))
 # TODO: CHECK HERE WHY IS DESCRITOR A TENSOR
 
 
@@ -176,3 +179,41 @@ class MultiViewTriangulator:
             print(f"[TRIANGULATION] Added {len(new_ids)} new point(s) to the map")
 
         return new_ids
+
+
+# --------------------------------------------------------------------------- #
+#  Basic 2 view Triangulation function (To be used as a fallback)
+# --------------------------------------------------------------------------- #
+def triangulate_points(
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    pts1: np.ndarray,
+    pts2: np.ndarray,
+) -> np.ndarray:
+    """Triangulate corresponding *pts1* ↔ *pts2* given (R, t).
+
+    Parameters
+    ----------
+    K
+        3×3 camera intrinsic matrix.
+    R, t
+        Rotation + translation from *view‑1* to *view‑2*.
+    pts1, pts2
+        Nx2 arrays of pixel coordinates (dtype float32/float64).
+    Returns
+    -------
+    pts3d
+        Nx3 array in *view‑1* camera coordinates (not yet in world frame).
+    """
+    if pts1.shape != pts2.shape:
+        raise ValueError("pts1 and pts2 must be the same shape")
+    if pts1.ndim != 2 or pts1.shape[1] != 2:
+        raise ValueError("pts1/pts2 must be (N,2)")
+
+    proj1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+    proj2 = K @ np.hstack((R, t.reshape(3, 1))) # Equivalent to proj1 @ get_homo_from_pose_rt(R, t)
+
+    pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T) # TODO: do triangulation from scratch for N observations
+    pts3d = (pts4d_h[:3] / pts4d_h[3]).T  # → (N,3)
+    return pts3d
