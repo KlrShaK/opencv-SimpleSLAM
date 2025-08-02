@@ -5,13 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+import cv2
 import numpy as np
 from .landmark_utils import Map
 
+from slam.core.pose_utils import _pose_inverse
 
 # --------------------------------------------------------------------------- #
 #  Robust linear triangulation across ≥ 2 views
 # --------------------------------------------------------------------------- #
+# TODO: Numeric accuracy: Normalize image coordinates (Hartley normalization) before DLT
 def multi_view_triangulation(
     K: np.ndarray,
     poses_w_c: List[np.ndarray],              # M × 4×4  (cam→world)
@@ -28,7 +31,7 @@ def multi_view_triangulation(
     # Build A (2 M × 4)
     A = []
     for T_w_c, (u, v) in zip(poses_w_c, pts2d):
-        P = K @ np.linalg.inv(T_w_c)[:3, :4]
+        P = K @ _pose_inverse(T_w_c)[:3, :4]
         A.append(u * P[2] - P[0])
         A.append(v * P[2] - P[1])
     A = np.stack(A)
@@ -42,7 +45,7 @@ def multi_view_triangulation(
     # Cheats: cheirality, depth & reprojection
     reproj, depths = [], []
     for T_w_c, (u, v) in zip(poses_w_c, pts2d):
-        pc = - (np.linalg.inv(T_w_c) @ np.append(X, 1.0))[:3] # TODO ref-T1: NEW added '-', works not correct but works for now
+        pc = (_pose_inverse(T_w_c) @ np.append(X, 1.0))[:3]  
         if pc[2] <= 0:                             # behind the camera
             # print("Cheirality check failed:", pc)
             return None
@@ -57,6 +60,7 @@ def multi_view_triangulation(
     if np.mean(reproj) > max_rep_err:
         # print(f"Reprojection error check failed: {np.mean(reproj)} > {max_rep_err}")
         return None
+    # print(f"ONE Triangulated point: {X} (depths: {depths}, reproj: {reproj})")
     return X
 
 
@@ -68,7 +72,32 @@ class _Obs:
     kf_idx: int
     kp_idx: int
     uv: Tuple[float, float]
+    descriptor: np.ndarray
 
+#  2D - Track maintenance
+def update_and_prune_tracks(matches, prev_map, tracks,
+                            kp_curr, frame_idx, next_track_id,
+                            prune_age=30):
+    """
+    Continuation of simple 2-D point tracks across frames.
+    """
+    curr_map = {}
+
+    for m in matches:
+        q, t = m.queryIdx, m.trainIdx
+        x, y = map(int, kp_curr[t].pt)
+        tid   = prev_map.get(q, next_track_id)
+        if tid == next_track_id:
+            tracks[tid] = []
+            next_track_id += 1
+        curr_map[t] = tid
+        tracks[tid].append((frame_idx, x, y))
+
+    # prune dead tracks
+    for tid, pts in list(tracks.items()):
+        if frame_idx - pts[-1][0] > prune_age:
+            del tracks[tid]
+    return curr_map, tracks, next_track_id
 
 class MultiViewTriangulator:
     """
@@ -100,16 +129,26 @@ class MultiViewTriangulator:
     # ------------------------------------------------------------------ #
     def add_keyframe(self,
                      frame_idx: int,
-                     pose_w_c: np.ndarray,
+                     Twc_pose: np.ndarray,
                      kps: List,                       # List[cv2.KeyPoint]
                      track_map: Dict[int, int],
-                     img_bgr: np.ndarray) -> None:
+                     img_bgr: np.ndarray,
+                     descriptors: Optional[List[np.ndarray]]) -> None:
+
         """Register observations (and keep the *full-res* image for colour sampling)."""
-        self._kf_poses[frame_idx] = pose_w_c.copy()
+        self._kf_poses[frame_idx] = Twc_pose.copy()
         self._kf_imgs[frame_idx]  = img_bgr            # shallow copy is fine
+        default_desc = np.zeros(32, dtype=np.uint8)
+
         for kp_idx, tid in track_map.items():
             u, v = kps[kp_idx].pt
-            self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v)))
+            desc = descriptors[kp_idx] if descriptors is not None else default_desc
+            try:
+                self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc).copy()))
+            except:
+                self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc.cpu()).copy()))
+            # TODO: CHECK HERE WHY IS DESCRITOR A TENSOR
+
 
     # ------------------------------------------------------------------ #
     def triangulate_ready_tracks(self, world_map: Map) -> List[int]:
@@ -121,22 +160,21 @@ class MultiViewTriangulator:
                 continue
             
             obs_sorted = sorted(obs, key=lambda o: o.kf_idx)
-            poses, pts2d = [], []
+            Twc_poses, pts2d = [], []
             for o in obs_sorted:
                 pose = self._kf_poses.get(o.kf_idx)
                 if pose is None:
                     break
-                poses.append(pose)
+                Twc_poses.append(pose)
                 pts2d.append(o.uv)
             else:
                 # print(f"Triangulating track {tid} with {len(obs)} observations")
                 X = multi_view_triangulation(
-                    self.K, poses, np.float32(pts2d),
+                    self.K, Twc_poses, np.float32(pts2d),
                     min_depth=self.min_depth,
                     max_depth=self.max_depth,
                     max_rep_err=self.max_rep_err,
                 )
-                # print(" Triangulated 3D point:", X)
                 if X is None:
                     continue
 
@@ -154,15 +192,53 @@ class MultiViewTriangulator:
                         break
 
                 # --------------- map insertion (+ optional merging) -------------
-                X = world_map.align_points_to_map(
-                    X[None, :], radius=self.merge_radius
-                )[0]
-                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]))[0]
+                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]), keyframe_idx=-1)[0]
                 for o in obs_sorted:
-                    world_map.points[pid].add_observation(o.kf_idx, o.kp_idx)
+                    world_map.points[pid].add_observation(o.kf_idx, o.kp_idx, o.descriptor)
 
                 new_ids.append(pid)
                 self._triangulated.add(tid)
                 self._track_obs.pop(tid, None)           # free memory
 
+        if new_ids:
+            print(f"[TRIANGULATION] Added {len(new_ids)} new point(s) to the map")
+
         return new_ids
+
+
+# --------------------------------------------------------------------------- #
+#  Basic 2 view Triangulation function (To be used as a fallback)
+# --------------------------------------------------------------------------- #
+def triangulate_points(
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    pts1: np.ndarray,
+    pts2: np.ndarray,
+) -> np.ndarray:
+    """Triangulate corresponding *pts1* ↔ *pts2* given (R, t).
+
+    Parameters
+    ----------
+    K
+        3×3 camera intrinsic matrix.
+    R, t
+        Rotation + translation from *view‑1* to *view‑2*.
+    pts1, pts2
+        Nx2 arrays of pixel coordinates (dtype float32/float64).
+    Returns
+    -------
+    pts3d
+        Nx3 array in *view‑1* camera coordinates (not yet in world frame).
+    """
+    if pts1.shape != pts2.shape:
+        raise ValueError("pts1 and pts2 must be the same shape")
+    if pts1.ndim != 2 or pts1.shape[1] != 2:
+        raise ValueError("pts1/pts2 must be (N,2)")
+
+    proj1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+    proj2 = K @ np.hstack((R, t.reshape(3, 1))) # Equivalent to proj1 @ get_homo_from_pose_rt(R, t)
+
+    pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T) # TODO: do triangulation from scratch for N observations
+    pts3d = (pts4d_h[:3] / pts4d_h[3]).T  # → (N,3)
+    return pts3d

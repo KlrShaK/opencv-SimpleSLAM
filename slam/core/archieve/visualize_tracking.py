@@ -298,25 +298,6 @@ def detect_and_match(args, img1, img2, detector, matcher):
     
     return kp_map1, kp_map2, des1, des2, matches
 
-def is_new_keyframe(frame_idx, matches_to_kf, n_kf_features, kp_curr, kp_kf, kf_max_disp,
-                    kf_min_ratio, kf_cooldown, last_kf_idx):
-    """Return True if current frame should become a new key-frame."""
-    if frame_idx - last_kf_idx < kf_cooldown:
-        return False                        # still in cool-down window
-
-    # --- 1) Relative overlap test ----------------------------------------
-    overlap_ratio = len(matches_to_kf) / float(n_kf_features)
-    if overlap_ratio < kf_min_ratio:
-        return True                         # we lost too many tracks
-
-    # --- 2) Parallax test (unchanged) ------------------------------------
-    disp = [
-        np.linalg.norm(
-            np.array(kp_curr[m.trainIdx].pt) -
-            np.array(kp_kf[m.queryIdx].pt)
-        ) for m in matches_to_kf
-    ]
-    return np.mean(disp) > kf_max_disp
 
 @dataclass
 class Keyframe:
