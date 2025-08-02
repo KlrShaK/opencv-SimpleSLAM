@@ -474,7 +474,7 @@ def main():
             #  frame_idx=len(world_map.poses)-1)
 
         # ------------------------------------------------ map growth ------------------------------------------------
-        if  is_kf and (len(kfs) % args.local_ba_window == 0):
+        if  is_kf:
             # 1) hand the new KF to the multi-view triangulator
             mvt.add_keyframe(
                 frame_idx=frame_no,            # global frame number of this KF
@@ -490,15 +490,15 @@ def main():
             # 3) visualisation hook
             new_ids = new_mvt_ids                # keeps 3-D viewer in sync
 
-
-            # pose_prev = cur_pose.copy()
-            # center_kf_idx = kfs[-1].idx
-            # if len(world_map.keyframe_indices) > args.local_ba_window:
-            #     print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
-            #     local_bundle_adjustment(
-            #         world_map, K, frame_keypoints,
-            #         center_kf_idx= len(world_map.poses) - 1,
-            #         window_size= args.local_ba_window)
+        # ------------------------------------------------ Local Bundle Adjustment ------------------------------------------------
+        if is_kf and (len(kfs) % args.local_ba_window == 0): # or len(world_map.keyframe_indices) > args.local_ba_window
+            pose_prev = Twc_cur_pose.copy()
+            center_kf_idx = kfs[-1].idx
+            print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
+            local_bundle_adjustment(
+                world_map, K, frame_keypoints,
+                center_kf_idx=len(world_map.poses) - 1,
+                window_size=args.local_ba_window)
 
         # p = Twc_cur_pose[:3, 3]
         # p_gt = gt_T[i + 1, :3, 3]
