@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
+import cv2
 import numpy as np
 from .landmark_utils import Map
 
@@ -73,6 +74,30 @@ class _Obs:
     uv: Tuple[float, float]
     descriptor: np.ndarray
 
+#  2D - Track maintenance
+def update_and_prune_tracks(matches, prev_map, tracks,
+                            kp_curr, frame_idx, next_track_id,
+                            prune_age=30):
+    """
+    Continuation of simple 2-D point tracks across frames.
+    """
+    curr_map = {}
+
+    for m in matches:
+        q, t = m.queryIdx, m.trainIdx
+        x, y = map(int, kp_curr[t].pt)
+        tid   = prev_map.get(q, next_track_id)
+        if tid == next_track_id:
+            tracks[tid] = []
+            next_track_id += 1
+        curr_map[t] = tid
+        tracks[tid].append((frame_idx, x, y))
+
+    # prune dead tracks
+    for tid, pts in list(tracks.items()):
+        if frame_idx - pts[-1][0] > prune_age:
+            del tracks[tid]
+    return curr_map, tracks, next_track_id
 
 class MultiViewTriangulator:
     """
@@ -122,7 +147,7 @@ class MultiViewTriangulator:
                 self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc).copy()))
             except:
                 self._track_obs.setdefault(tid, []).append(_Obs(frame_idx, kp_idx, (u, v), np.array(desc.cpu()).copy()))
-# TODO: CHECK HERE WHY IS DESCRITOR A TENSOR
+            # TODO: CHECK HERE WHY IS DESCRITOR A TENSOR
 
 
     # ------------------------------------------------------------------ #
@@ -167,7 +192,7 @@ class MultiViewTriangulator:
                         break
 
                 # --------------- map insertion (+ optional merging) -------------
-                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]))[0]
+                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]), keyframe_idx=-1)[0]
                 for o in obs_sorted:
                     world_map.points[pid].add_observation(o.kf_idx, o.kp_idx, o.descriptor)
 

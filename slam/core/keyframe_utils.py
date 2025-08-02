@@ -12,6 +12,7 @@ from slam.core.features_utils import feature_matcher, filter_matches_ransac
 @dataclass
 class Keyframe:
     idx:   int                    # global frame index
+    frame_idx: int                # actual frame number (0-based), where this KF was created
     path:  str                    # "" for in-memory frames
     kps:   list[cv2.KeyPoint]
     desc:  np.ndarray
@@ -35,11 +36,11 @@ def is_new_keyframe(frame_idx,
                     kf_max_disp=30.0,
                     kf_min_inliers=125,
                     kf_cooldown=5,
-                    last_kf_idx=-999):
+                    last_kf_frame_no=-999):
     """
     Decide whether current frame should be promoted to a Keyframe.
     """
-    if frame_idx - last_kf_idx > kf_cooldown: 
+    if frame_idx - last_kf_frame_no > kf_cooldown: 
         return True  # enough time has passed since last KF
     if not matches_to_kf:
         return True
@@ -51,7 +52,6 @@ def is_new_keyframe(frame_idx,
             for m in matches_to_kf]
     return np.mean(disp) > kf_max_disp
 
-# TODO add pose
 def select_keyframe(
     args,
     seq: List[str],
@@ -60,7 +60,7 @@ def select_keyframe(
     pose2,
     matcher,
     kfs: List[Keyframe],
-    last_kf_idx: int
+    last_kf_frame_no: int
 ) -> Tuple[List[Keyframe], int]:
     """
     Decide whether to add a new Keyframe at this iteration.
@@ -72,7 +72,7 @@ def select_keyframe(
     seq
         Original sequence list (so we can grab file paths if needed).
     frame_idx
-        Zero-based index of the *first* of the pair.  Keyframes use i+1 as frame number.
+        zero-based index of the *first* of the pair.  Keyframes use i+1 as frame number.
     img2
         BGR image for frame i+1 (for thumbnail if we promote).
     kp2, des2
@@ -83,15 +83,15 @@ def select_keyframe(
         Either the OpenCV BF/FLANN matcher or the LightGlue matcher.
     kfs
         Current list of Keyframe objects.
-    last_kf_idx
+    last_kf_frame_no
         Frame number (1-based) of the last keyframe added; or -inf if none.
 
     Returns
     -------
     kfs
         Possibly-extended list of Keyframe objects.
-    last_kf_idx
-        Updated last keyframe index (still the same if we didn’t add one).
+    last_kf_frame_no
+        Updated last keyframe frame number (still the same if we didn’t add one).
     """
     frame_no = frame_idx + 1
     prev_kf = kfs[-1]
@@ -106,38 +106,11 @@ def select_keyframe(
 
     # 3) promotion test
     if is_new_keyframe(frame_no, matches, kp2, prev_kf.kps, args.kf_max_disp, args.kf_min_inliers,
-                       args.kf_cooldown, last_kf_idx):
+                       args.kf_cooldown, last_kf_frame_no):
         thumb = make_thumb(img2, tuple(args.kf_thumb_hw))
         path  = seq[frame_idx + 1] if isinstance(seq[frame_idx + 1], str) else ""
-        kfs.append(Keyframe(frame_no, path, kp2, des2, pose2, thumb))
-        last_kf_idx = frame_no
+        seq_id = len(kfs)          # 0-based sequential KF ID; use +1 for 1-based
+        kfs.append(Keyframe(seq_id, frame_no, path, kp2, des2, pose2, thumb))
+        last_kf_frame_no = frame_no
 
-    return kfs, last_kf_idx
-
-
-# --------------------------------------------------------------------------- #
-#  Track maintenance
-# --------------------------------------------------------------------------- #
-def update_and_prune_tracks(matches, prev_map, tracks,
-                            kp_curr, frame_idx, next_track_id,
-                            prune_age=30):
-    """
-    Continuation of simple 2-D point tracks across frames.
-    """
-    curr_map = {}
-
-    for m in matches:
-        q, t = m.queryIdx, m.trainIdx
-        x, y = map(int, kp_curr[t].pt)
-        tid   = prev_map.get(q, next_track_id)
-        if tid == next_track_id:
-            tracks[tid] = []
-            next_track_id += 1
-        curr_map[t] = tid
-        tracks[tid].append((frame_idx, x, y))
-
-    # prune dead tracks
-    for tid, pts in list(tracks.items()):
-        if frame_idx - pts[-1][0] > prune_age:
-            del tracks[tid]
-    return curr_map, tracks, next_track_id
+    return kfs, last_kf_frame_no

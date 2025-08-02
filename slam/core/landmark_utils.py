@@ -64,14 +64,17 @@ class Map:
 
     def __init__(self) -> None:
         self.points: Dict[int, MapPoint] = {}
+        self.keyframe_indices: set[int] = set()
         self.poses: List[np.ndarray] = []  # List of 4×4 camera‑to‑world matrices (World-from-Camera)
         self._next_pid: int = 0
 
     # ---------------- Camera trajectory ---------------- #
-    def add_pose(self, pose_w_c: np.ndarray) -> None:
+    def add_pose(self, pose_w_c: np.ndarray, is_keyframe: bool) -> None:
         """Append a 4×4 *pose_w_c* (camera‑to‑world) to the trajectory."""
         assert pose_w_c.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
         self.poses.append(pose_w_c.copy())
+        if is_keyframe:
+            self.keyframe_indices.add(len(self.poses) - 1)
 
     # ---------------- Landmarks ------------------------ #
     def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None,
@@ -93,31 +96,6 @@ class Map:
             new_ids.append(pid)
             self._next_pid += 1
         return new_ids
-
-    # def add_points(self,
-    #                xyz   : np.ndarray,             # (M,3) float32/64
-    #                rgb   : np.ndarray | None = None  # (M,3) float32 in [0,1]
-    #                ) -> list[int]:
-    #     """
-    #     Insert M new landmarks and return their integer ids.
-    #     `rgb` may be omitted – we then default to light-grey.
-    #     """
-    #     xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
-    #     if rgb is None:
-    #         rgb = np.full_like(xyz, 0.8, dtype=np.float32)   # light grey
-    #     else:
-    #         rgb = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
-
-    #     assert xyz.shape == rgb.shape, \
-    #         "xyz and rgb must have the same length"
-
-    #     ids = list(range(self._next_pid, self._next_pid + len(xyz)))
-    #     self._next_pid += len(xyz)
-
-    #     for pid, p, c in zip(ids, xyz, rgb):
-    #         self.points[pid] = MapPoint(pid, p, c)
-
-    #     return ids
 
 
     # ---------------- Convenience accessors ------------ #
@@ -163,40 +141,3 @@ class Map:
         for idx in removed:
             self.points.pop(idx, None)
 
-
-# --------------------------------------------------------------------------- #
-#  Geometry helpers (stay here to avoid cyclic imports)
-# --------------------------------------------------------------------------- #
-def triangulate_points(
-    K: np.ndarray,
-    R: np.ndarray,
-    t: np.ndarray,
-    pts1: np.ndarray,
-    pts2: np.ndarray,
-) -> np.ndarray:
-    """Triangulate corresponding *pts1* ↔ *pts2* given (R, t).
-
-    Parameters
-    ----------
-    K
-        3×3 camera intrinsic matrix.
-    R, t
-        Rotation + translation from *view‑1* to *view‑2*.
-    pts1, pts2
-        Nx2 arrays of pixel coordinates (dtype float32/float64).
-    Returns
-    -------
-    pts3d
-        Nx3 array in *view‑1* camera coordinates (not yet in world frame).
-    """
-    if pts1.shape != pts2.shape:
-        raise ValueError("pts1 and pts2 must be the same shape")
-    if pts1.ndim != 2 or pts1.shape[1] != 2:
-        raise ValueError("pts1/pts2 must be (N,2)")
-
-    proj1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
-    proj2 = K @ np.hstack((R, t.reshape(3, 1))) # Equivalent to proj1 @ get_homo_from_pose_rt(R, t)
-
-    pts4d_h = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T) # TODO: do triangulation from scratch for N observations
-    pts3d = (pts4d_h[:3] / pts4d_h[3]).T  # → (N,3)
-    return pts3d
