@@ -41,14 +41,13 @@ from slam.core.features_utils import (
 
 from slam.core.keyframe_utils import (
     Keyframe, 
-    update_and_prune_tracks, 
     select_keyframe, 
     make_thumb)
 
 from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
-from slam.core.landmark_utils import Map, triangulate_points
-from slam.core.multi_view_utils import MultiViewTriangulator
+from slam.core.landmark_utils import Map
+from slam.core.triangulation_utils import update_and_prune_tracks, MultiViewTriangulator, triangulate_points
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
 from slam.core.ba_utils import (
     two_view_ba,
@@ -95,14 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--pnp_min_inliers', type=int, default=30)
     p.add_argument('--proj_radius',     type=float, default=3.0)
     p.add_argument('--merge_radius',    type=float, default=0.10)
-    
+
+    # Bundle Adjustment
+    p.add_argument('--local_ba_window', type=int, default=5, help='Window size (number of keyframes) for local BA')
+
     return p
 
 
 # --------------------------------------------------------------------------- #
-#  Helper functions
+#  Bootstrap initialisation
 # --------------------------------------------------------------------------- #
-
 def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     """Return (success, T_cam0_w, T_cam1_w) and add initial landmarks."""
     if len(matches) < 50:
@@ -156,7 +157,7 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     T1_cw = _pose_rt_to_homogenous(R, t) # camera-from-world
     T1_wc = _pose_inverse(T1_cw)    # world-from-camera
     # 3. fill the map
-    world_map.add_pose(T1_wc)
+    world_map.add_pose(T1_wc, is_keyframe=True)  # Keyframe because we only bootstrap on keyframes
 
     cols = np.full((len(pts3d), 3), 0.7)   # grey – colour is optional here
     ids = world_map.add_points(pts3d, cols, keyframe_idx=1)
@@ -173,26 +174,6 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     print(f"[BOOTSTRAP] Map initialised with {len(ids)} landmarks.")
     return True, T1_wc
 
-
-def solve_pnp_step(K, pose_pred, world_map, kp, args, ):
-    """Return (success, refined_pose, used_kp_indices)."""
-    pts_w = world_map.get_point_array()
-    pts3d, pts2d, used = associate_landmarks(
-        K, pose_pred, pts_w, kp, args.proj_radius)
-
-    if len(pts3d) < args.pnp_min_inliers:
-        return False, pose_pred, used
-
-    R, t = refine_pose_pnp(K, pts3d, pts2d)
-    if R is None:
-        return False, pose_pred, used
-
-    # TODO:  :Look at the POSE HERE, ERROR is something related to this only
-    T_cw = _pose_rt_to_homogenous(R, t)
-    T_wc = _pose_inverse(T_cw)
-
-    print(f"[PNP] Pose refined with {len(pts3d)} inliers.")
-    return True, T_wc, used
 
 # --------------------------------------------------------------------------- #
 #  Continuous pose tracking (PnP)
@@ -264,6 +245,7 @@ def track_with_pnp(K,
         kp_prev_idx = m.queryIdx          # key-point index in previous frame
         kp_cur_idx  = m.trainIdx          # key-point index in current frame
 
+        # TODO: Examine this for-loop it could be taking a lot of time
         # See whether that previous key-point is an observation of a landmark
         for pid, mp in world_map.points.items():
             # mp.observations is a list of (frame_idx, kp_idx)
@@ -328,6 +310,7 @@ def track_with_pnp(K,
     print(f"[PNP]  Pose @ frame {frame_no} refined with {len(inl)} inliers")
     return True, Twc_cur, used_cur_idx
 
+
 # --------------------------------------------------------------------------- #
 #  Main processing loop
 # --------------------------------------------------------------------------- #
@@ -370,12 +353,12 @@ def main():
 
     world_map = Map()
     Twc_cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
-    world_map.add_pose(Twc_cur_pose)
+    world_map.add_pose(Twc_cur_pose, is_keyframe=True)  # initial pose
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
     plot2d = TrajectoryPlotter()           
 
     kfs: list[Keyframe] = []
-    last_kf_idx = -999
+    last_kf_frame_no = -999
 
     # TODO FOR BUNDLE ADJUSTMENT
     frame_keypoints: List[List[cv2.KeyPoint]] = []  #CHANGE
@@ -409,6 +392,7 @@ def main():
             print(f"[WARN] Not enough matches at frame {i}. Skipping.")
             continue
         
+        # ---------------- 2D - Feature Tracking --------------------------
         frame_no = i + 1
         curr_map, tracks, next_track_id = update_and_prune_tracks(
                 matches, prev_map, tracks, kp2, frame_no, next_track_id)
@@ -417,19 +401,19 @@ def main():
         # ---------------- Key-frame decision -------------------------- # TODO make every frame a keyframe
         frame_keypoints.append(kp2)
         if i == 0:
-            kfs.append(Keyframe(0, seq[0] if isinstance(seq[0], str) else "",
-                        kp1, des1, Twc_cur_pose, make_thumb(img1, tuple(args.kf_thumb_hw))))
-            last_kf_idx = 0
+            kfs.append(Keyframe(idx=0, frame_idx=0, path=seq[0] if isinstance(seq[0], str) else "",
+                        kps=kp1, desc=des1, pose=Twc_cur_pose, thumb=make_thumb(img1, tuple(args.kf_thumb_hw))))
+            last_kf_frame_no = kfs[-1].frame_idx
             prev_len = len(kfs)
             is_kf = False
             continue
         else:
             prev_len = len(kfs)
-            kfs, last_kf_idx = select_keyframe(
-                args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_idx)
+            kfs, last_kf_frame_no = select_keyframe(
+                args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_frame_no)
             is_kf = len(kfs) > prev_len
 
-        print("len(kfs) = ", len(kfs), "last_kf_idx = ", last_kf_idx)
+        # print("len(kfs) = ", len(kfs), "last_kf_frame_no = ", last_kf_frame_no)
         # ------------------------------------------------ bootstrap ------------------------------------------------ # TODO FIND A BETTER WAY TO manage index
         if not initialised:
             if len(kfs) < 2:
@@ -484,13 +468,13 @@ def main():
             Twc_cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
             tracking_lost = False
 
-        world_map.add_pose(Twc_cur_pose)        # always push *some* pose
+        world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)        # always push *some* pose
 
         # pose_only_ba(world_map, K, frame_keypoints,    # FOR BA
             #  frame_idx=len(world_map.poses)-1)
 
         # ------------------------------------------------ map growth ------------------------------------------------
-        if is_kf:
+        if  is_kf and (len(kfs) % args.local_ba_window == 0):
             # 1) hand the new KF to the multi-view triangulator
             mvt.add_keyframe(
                 frame_idx=frame_no,            # global frame number of this KF
@@ -508,15 +492,17 @@ def main():
 
 
             # pose_prev = cur_pose.copy()
+            # center_kf_idx = kfs[-1].idx
+            # if len(world_map.keyframe_indices) > args.local_ba_window:
+            #     print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
+            #     local_bundle_adjustment(
+            #         world_map, K, frame_keypoints,
+            #         center_kf_idx= len(world_map.poses) - 1,
+            #         window_size= args.local_ba_window)
 
-            # local_bundle_adjustment(
-            #     world_map, K, frame_keypoints,
-            #     center_kf_idx=last_kf_idx,
-            #     window_size=8 )
-
-        p = Twc_cur_pose[:3, 3]
-        p_gt = gt_T[i + 1, :3, 3]
-        print(f"Cam position z = {p}, GT = {p_gt}  (should decrease on KITTI)")
+        # p = Twc_cur_pose[:3, 3]
+        # p_gt = gt_T[i + 1, :3, 3]
+        # print(f"Cam position z = {p}, GT = {p_gt}  (should decrease on KITTI)")
 
         # --- 2-D path plot (cheap) ----------------------------------------------
         est_pos = Twc_cur_pose[:3, 3]

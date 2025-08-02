@@ -5,7 +5,7 @@ set -e
 # 1) Run with OpenCV SIFT detector + BF matcher:
 # ==============================================
 # python3 -m slam.monocular.main  \
-#   --dataset kitti \
+#   --dataset tum-rgbd \
 #   --base_dir ./Dataset \
 #   --detector akaze \
 #   --matcher bf \
@@ -16,7 +16,7 @@ set -e
 # ==============================================
 # 2) (Alternative) Run with ALIKED + LightGlue:
 # ==============================================
-python3 -m slam.monocular.main4 \
+python3 -m slam.monocular.main \
   --dataset kitti \
   --base_dir ./Dataset \
   --use_lightglue \
