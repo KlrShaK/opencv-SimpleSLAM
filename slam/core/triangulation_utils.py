@@ -192,7 +192,8 @@ class MultiViewTriangulator:
                         break
 
                 # --------------- map insertion (+ optional merging) -------------
-                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]), keyframe_idx=-1)[0]
+                kf_idx = world_map.keyframe_indices[-1] if world_map.keyframe_indices else (len(world_map.poses) - 1)
+                pid = world_map.add_points(X[None, :], np.float32([[*rgb]]), keyframe_idx=kf_idx)[0]
                 for o in obs_sorted:
                     world_map.points[pid].add_observation(o.kf_idx, o.kp_idx, o.descriptor)
 

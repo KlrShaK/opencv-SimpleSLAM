@@ -160,7 +160,7 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     world_map.add_pose(T1_wc, is_keyframe=True)  # Keyframe because we only bootstrap on keyframes
 
     cols = np.full((len(pts3d), 3), 0.7)   # grey – colour is optional here
-    ids = world_map.add_points(pts3d, cols, keyframe_idx=1)
+    ids = world_map.add_points(pts3d, cols, keyframe_idx=0) #TODO 0 or 1
 
     # -----------------------------------------------
     # add (frame_idx , kp_idx) pairs for each new MP
@@ -248,18 +248,18 @@ def track_with_pnp(K,
         # TODO: Examine this for-loop it could be taking a lot of time
         # See whether that previous key-point is an observation of a landmark
         for pid, mp in world_map.points.items():
-            # mp.observations is a list of (frame_idx, kp_idx)
+            # mp.observations is a list of (frame_idx, kp_idx, descriptor)
+            # print(pid, )
             if any(f == prev_frame and k == kp_prev_idx for f, k, _ in mp.observations):
+                # print(mp.position)
                 obj_pts.append(mp.position)          # ← 3-D point (world)
                 img_pts.append(kp_cur[kp_cur_idx].pt) # ← 2-D measurement
                 obj_pids.append(pid)
                 kp_cur_ids.append(kp_cur_idx)
                 break
-
     if len(obj_pts) < args.pnp_min_inliers:
-        print(f"[PNP]  Not enough 2-D/3-D pairs: {len(obj_pts)} < {args.pnp_min_inliers}")
         return False, None, set()
-
+    
     obj_pts = np.ascontiguousarray(obj_pts, dtype=np.float32)
     img_pts = np.ascontiguousarray(img_pts, dtype=np.float32)
 
@@ -399,9 +399,9 @@ def main():
         prev_map = curr_map                       # for the next iteration
 
         # ---------------- Key-frame decision -------------------------- # TODO make every frame a keyframe
-        frame_keypoints.append(kp2)
+        
         if i == 0:
-            kfs.append(Keyframe(idx=0, frame_idx=0, path=seq[0] if isinstance(seq[0], str) else "",
+            kfs.append(Keyframe(idx=0, frame_idx=1, path=seq[0] if isinstance(seq[0], str) else "",
                         kps=kp1, desc=des1, pose=Twc_cur_pose, thumb=make_thumb(img1, tuple(args.kf_thumb_hw))))
             last_kf_frame_no = kfs[-1].frame_idx
             prev_len = len(kfs)
@@ -412,7 +412,9 @@ def main():
             kfs, last_kf_frame_no = select_keyframe(
                 args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_frame_no)
             is_kf = len(kfs) > prev_len
-
+        
+        if is_kf:
+            frame_keypoints.append(kp2)
         # print("len(kfs) = ", len(kfs), "last_kf_frame_no = ", last_kf_frame_no)
         # ------------------------------------------------ bootstrap ------------------------------------------------ # TODO FIND A BETTER WAY TO manage index
         if not initialised:
@@ -468,7 +470,8 @@ def main():
             Twc_cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
             tracking_lost = False
 
-        world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)        # always push *some* pose
+        if is_kf:
+            world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)        # always push *some* pose
 
         # pose_only_ba(world_map, K, frame_keypoints,    # FOR BA
             #  frame_idx=len(world_map.poses)-1)
@@ -476,8 +479,9 @@ def main():
         # ------------------------------------------------ map growth ------------------------------------------------
         if  is_kf:
             # 1) hand the new KF to the multi-view triangulator
+            kf_pose_idx = len(world_map.poses) - 1       # this is the new pose’s index
             mvt.add_keyframe(
-                frame_idx=frame_no,            # global frame number of this KF
+                frame_idx=kf_pose_idx,            # global frame number of this KF
                 Twc_pose=Twc_cur_pose,
                 kps=kp2,
                 track_map=curr_map,
@@ -491,14 +495,16 @@ def main():
             new_ids = new_mvt_ids                # keeps 3-D viewer in sync
 
         # ------------------------------------------------ Local Bundle Adjustment ------------------------------------------------
-        if is_kf and (len(kfs) % args.local_ba_window == 0): # or len(world_map.keyframe_indices) > args.local_ba_window
-            pose_prev = Twc_cur_pose.copy()
-            center_kf_idx = kfs[-1].idx
-            print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
-            local_bundle_adjustment(
-                world_map, K, frame_keypoints,
-                center_kf_idx=len(world_map.poses) - 1,
-                window_size=args.local_ba_window)
+        # if is_kf and (len(kfs) % args.local_ba_window == 0): # or len(world_map.keyframe_indices) > args.local_ba_window
+        #     pose_prev = Twc_cur_pose.copy()
+        #     center_kf_idx = kfs[-1].idx
+        #     print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
+        #     print(f'len keyframes = {len(kfs)}, len frame_keypoints = {len(frame_keypoints)}, len poses = {len(world_map.poses)}')
+        #     # print(f"world_map.poses = {len(world_map.poses)}, \n raw: {world_map.poses} \n keyframe_indices= {len(world_map.keyframe_indices)},\n raw: {world_map.keyframe_indices}")
+        #     local_bundle_adjustment(
+        #         world_map, K, frame_keypoints,
+        #         center_kf_idx=len(world_map.poses) - 1,
+        #         window_size=args.local_ba_window)
 
         # p = Twc_cur_pose[:3, 3]
         # p_gt = gt_T[i + 1, :3, 3]

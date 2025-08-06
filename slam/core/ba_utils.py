@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# TODO ADD LOGIC TO ONLY MODIFY THE POINTS IN THE MAP IF REPROJECTION ERROR IS BELOW A THRESHOLD or REDUCED
 """
 ba_utils.py
 ===========
@@ -23,10 +24,10 @@ from pycolmap import cost_functions, CameraModelId
 import math
 from scipy.spatial.transform import Rotation as R
 
-# TODO: USES camera-to-world pose convention T_wc (camera→world) because of PyCERES, REMEMBER TO CONVERT, use below functions
+# TODO: USES T_cw (camera-from-world) convention for storing poses in the map, because of PyCERES, REMEMBER TO CONVERT, use below functions
 # from slam.core.pose_utils import _pose_inverse, _pose_to_quat_trans, _quat_trans_to_pose
 
-# TODO : UNCOMMENT IF YOU USE T_cw (camera-from-world) convention
+# TODO : UNCOMMENT below block IF YOU USE USES World-from-camera (camera-to-world) pose convention T_wc (camera→world) for storing poses in the map.
 from slam.core.pose_utils import (
     _pose_inverse,           # T ↔ T⁻¹
     _pose_to_quat_trans as _cw_to_quat_trans,
@@ -110,7 +111,7 @@ def pose_only_ba(world_map, K, keypoints,
     for mp in world_map.points.values():
         problem.add_parameter_block(mp.position, 3)
         problem.set_parameter_block_constant(mp.position)
-        for f_idx, kp_idx in mp.observations:
+        for f_idx, kp_idx, descriptor in mp.observations:
             if f_idx != frame_idx:
                 continue
             u, v = keypoints[f_idx][kp_idx].pt
@@ -139,24 +140,25 @@ def pose_only_ba(world_map, K, keypoints,
 # --------------------------------------------------------------------- #
 def local_bundle_adjustment(world_map, K, keypoints,
                             center_kf_idx: int,
-                            window_size: int = 8,
-                            max_points  : int = 3000,
+                            window_size: int = 5,
+                            max_points  : int = 10000,
                             max_iters   : int = 15):
     """
     Optimise the *last* `window_size` key-frames around
     `center_kf_idx` plus all landmarks they observe.
     Older poses are kept fixed (gauge).
     """
-    first_opt = max(0, center_kf_idx - window_size + 1)
+    first_opt = max(1, center_kf_idx - window_size + 1)
     opt_kf    = list(range(first_opt, center_kf_idx + 1))
     fix_kf    = list(range(0, first_opt))
 
     _core_ba(world_map, K, keypoints,
-             opt_kf_idx=opt_kf,
-             fix_kf_idx=fix_kf,
-             max_points=max_points,
-             max_iters=max_iters,
-             info_tag=f"[Local BA (kf {center_kf_idx})]")
+             opt_kf_idx = opt_kf,
+             fix_kf_idx = fix_kf,
+             max_points = max_points,
+             max_iters  = max_iters,
+             info_tag   = f"[Local BA @ kf {center_kf_idx}]")
+
 
 
 # --------------------------------------------------------------------- #
@@ -223,14 +225,15 @@ def _core_ba(world_map, K, keypoints,
     added_pts = 0
     for mp in world_map.points.values():
         # keep only points seen by at least one optimisable KF
-        if not any(f in opt_kf_idx for f, _ in mp.observations):
+        if not any(f in opt_kf_idx for f, _, _ in mp.observations):
+            # print(f"Skipping point {mp.id} with observations {mp.observations[0][0]}")
             continue
         if max_points and added_pts >= max_points:
             continue
         problem.add_parameter_block(mp.position, 3)
         added_pts += 1
 
-        for f_idx, kp_idx in mp.observations:
+        for f_idx, kp_idx, descriptors in mp.observations:
             if f_idx not in opt_kf_idx and f_idx not in fix_kf_idx:
                 continue
             u, v = keypoints[f_idx][kp_idx].pt

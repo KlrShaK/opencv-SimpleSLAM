@@ -41,7 +41,7 @@ class MapPoint:
         RGB colour (linear, 0‑1) associated with the point (shape ``(3,)``).
     observations
         List of observations in the form ``(frame_idx, kp_idx, descriptor)`` where
-        * ``frame_idx`` – index of the frame where the keypoint was detected.
+        * ``keyframe_idx`` – Keyframe - idx where the keypoint was detected.
         * ``kp_idx``    – index of the keypoint inside that frame.
         * ``descriptor`` – feature descriptor as a 1‑D ``np.ndarray``.
     """
@@ -49,11 +49,11 @@ class MapPoint:
     position: np.ndarray  # shape (3,)
     keyframe_idx: int = -1
     colour: np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
-    observations: List[Tuple[int, int, np.ndarray]] = field(default_factory=list)  # (frame_idx, kp_idx, descriptor)
+    observations: List[Tuple[int, int, np.ndarray]] = field(default_factory=list)  # (keyframe_idx, kp_idx, descriptor)
 
-    def add_observation(self, frame_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
-        """Register that *kp_idx* in *frame_idx* observes this landmark."""
-        self.observations.append((frame_idx, kp_idx, descriptor))
+    def add_observation(self, keyframe_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
+        """Register that *kp_idx* in *keyframe_idx* observes this landmark."""
+        self.observations.append((keyframe_idx, kp_idx, descriptor))
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +64,7 @@ class Map:
 
     def __init__(self) -> None:
         self.points: Dict[int, MapPoint] = {}
-        self.keyframe_indices: set[int] = set()
+        self.keyframe_indices: List[int] = []
         self.poses: List[np.ndarray] = []  # List of 4×4 camera‑to‑world matrices (World-from-Camera)
         self._next_pid: int = 0
 
@@ -74,7 +74,7 @@ class Map:
         assert pose_w_c.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
         self.poses.append(pose_w_c.copy())
         if is_keyframe:
-            self.keyframe_indices.add(len(self.poses) - 1)
+            self.keyframe_indices.append(len(self.poses) - 1)
 
     # ---------------- Landmarks ------------------------ #
     def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None,

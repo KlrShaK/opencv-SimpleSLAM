@@ -48,7 +48,7 @@ from slam.core.keyframe_utils import (
 from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map, triangulate_points
-from slam.core.multi_view_utils import MultiViewTriangulator
+from slam.core.triangulation_utils import MultiViewTriangulator
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
 from slam.core.ba_utils import (
     two_view_ba,
