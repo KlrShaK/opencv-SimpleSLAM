@@ -14,6 +14,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from typing import List, Tuple, Sequence
+from slam.core.pose_utils import _pose_rt_to_homogenous
 
 # --------------------------------------------------------------- #
 #  Projection helper
@@ -105,4 +106,4 @@ def refine_pose_pnp(
         K, None, rvec, tvec
     )
     R, _ = cv2.Rodrigues(rvec)
-    return R, tvec.ravel()  # R: 3×3, t: 3×1, # 1-D (3,) instead of (3,1)
+    return R, tvec  # R: 3×3, t: 3×1, # 1-D (3,) instead of (3,1)

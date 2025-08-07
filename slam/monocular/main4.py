@@ -23,7 +23,7 @@ import cv2
 import lz4.frame
 import numpy as np
 from tqdm import tqdm
-from typing import List
+from typing import List, Sequence, Tuple
 
 from slam.core.pose_utils import _pose_inverse, _pose_rt_to_homogenous
 
@@ -41,14 +41,13 @@ from slam.core.features_utils import (
 
 from slam.core.keyframe_utils import (
     Keyframe, 
-    update_and_prune_tracks, 
     select_keyframe, 
     make_thumb)
 
 from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
-from slam.core.landmark_utils import Map, triangulate_points
-from slam.core.triangulation_utils import MultiViewTriangulator
+from slam.core.landmark_utils import Map
+from slam.core.triangulation_utils import update_and_prune_tracks, MultiViewTriangulator, triangulate_points
 from slam.core.pnp_utils import associate_landmarks, refine_pose_pnp
 from slam.core.ba_utils import (
     two_view_ba,
@@ -95,14 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--pnp_min_inliers', type=int, default=30)
     p.add_argument('--proj_radius',     type=float, default=3.0)
     p.add_argument('--merge_radius',    type=float, default=0.10)
-    
+
+    # Bundle Adjustment
+    p.add_argument('--local_ba_window', type=int, default=5, help='Window size (number of keyframes) for local BA')
+
     return p
 
 
 # --------------------------------------------------------------------------- #
-#  Helper functions
+#  Bootstrap initialisation
 # --------------------------------------------------------------------------- #
-
 def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     """Return (success, T_cam0_w, T_cam1_w) and add initial landmarks."""
     if len(matches) < 50:
@@ -156,10 +157,10 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     T1_cw = _pose_rt_to_homogenous(R, t) # camera-from-world
     T1_wc = _pose_inverse(T1_cw)    # world-from-camera
     # 3. fill the map
-    world_map.add_pose(T1_wc)
+    world_map.add_pose(T1_wc, is_keyframe=True)  # Keyframe because we only bootstrap on keyframes
 
     cols = np.full((len(pts3d), 3), 0.7)   # grey – colour is optional here
-    ids = world_map.add_points(pts3d, cols, keyframe_idx=1)
+    ids = world_map.add_points(pts3d, cols, keyframe_idx=0) #TODO 0 or 1
 
     # -----------------------------------------------
     # add (frame_idx , kp_idx) pairs for each new MP
@@ -174,75 +175,265 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     return True, T1_wc
 
 
-def solve_pnp_step(K, pose_pred, world_map, kp, args, ):
-    """Return (success, refined_pose, used_kp_indices)."""
-    pts_w = world_map.get_point_array()
-    pts3d, pts2d, used = associate_landmarks(
-        K, pose_pred, pts_w, kp, args.proj_radius)
-
-    if len(pts3d) < args.pnp_min_inliers:
-        return False, pose_pred, used
-
-    R, t = refine_pose_pnp(K, pts3d, pts2d)
-    if R is None:
-        return False, pose_pred, used
-
-    # TODO:  :Look at the POSE HERE, ERROR is something related to this only
-    T_cw = _pose_rt_to_homogenous(R, t)
-    T_wc = _pose_inverse(T_cw)
-
-    print(f"[PNP] Pose refined with {len(pts3d)} inliers.")
-    return True, T_wc, used
-
 # --------------------------------------------------------------------------- #
 #  Continuous pose tracking (PnP)
 # --------------------------------------------------------------------------- #
+def visualize_pnp_reprojection(img_bgr, K, T_wc, pts3d_w, pts2d_px, inlier_mask=None,
+                               win_name="PnP debug", thickness=2):
+    """
+    Draw projected 3‑D landmarks (from world) on top of the current image and connect
+    them to the actual detected keypoints.
+
+    img_bgr     : current image (BGR)
+    K           : 3x3 intrinsics
+    T_wc        : 4x4 pose (cam->world)
+    pts3d_w     : (N,3) 3D points in *world* coords
+    pts2d_px    : (N,2) measured pixel locations that took part in PnP
+    inlier_mask : optional boolean array (len=N). If given, only inliers get lines.
+    """
+    import cv2
+    import numpy as np
+
+    img = img_bgr.copy()
+    # world -> cam
+    T_cw = np.linalg.inv(T_wc)
+    R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
+    rvec, _ = cv2.Rodrigues(R_cw)
+    tvec = t_cw.reshape(3, 1)
+
+    proj, _ = cv2.projectPoints(pts3d_w.astype(np.float32), rvec, tvec, K, None)
+    proj = proj.reshape(-1, 2)
+
+    if inlier_mask is None:
+        inlier_mask = np.ones(len(proj), dtype=bool)
+
+    for (u_meas, v_meas), (u_proj, v_proj), ok in zip(pts2d_px, proj, inlier_mask):
+        color = (0, 255, 0) if ok else (0, 0, 255)  # green for inlier, red for outlier
+        cv2.circle(img, (int(round(u_proj)), int(round(v_proj))), 4, (255, 0, 0), -1)    # projected (blue)
+        cv2.circle(img, (int(round(u_meas)), int(round(v_meas))), 4, color, -1)          # measured
+        if ok:
+            cv2.line(img, (int(round(u_meas)), int(round(v_meas))),
+                          (int(round(u_proj)), int(round(v_proj))), color, thickness)
+
+    cv2.imshow(win_name, img)
+    cv2.waitKey(1)
+    return img
+
+# pnp_utils.py  (NEW)
+
+# ------------ parameters (mimic ORB-SLAM) -------------
+GRID_ROWS = 48          # 640×480 → ≈13 px cells
+GRID_COLS = 64
+MIN_VIEW_COS = 0.5      # landmark normal · viewing dir  (optional)
+
+# ------------------------------------------------------ #
+#  Image-space grid holding indices of key-points
+# ------------------------------------------------------ #
+def _build_grid(kps: Sequence[cv2.KeyPoint],
+                img_h: int, img_w: int
+) -> Tuple[List[List[List[int]]], float, float]:
+    cell_w = img_w / GRID_COLS
+    cell_h = img_h / GRID_ROWS
+    grid = [[[] for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
+    for idx, kp in enumerate(kps):
+        c, r = int(kp.pt[0] / cell_w), int(kp.pt[1] / cell_h)
+        if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
+            grid[r][c].append(idx)
+    return grid, cell_w, cell_h
+
+# pnp_utils.py  (REPLACES associate_landmarks)
+from scipy.spatial.transform import Rotation as Rot
+
+def associate_landmarks(
+    K:          np.ndarray,
+    pose_w_c:   np.ndarray,        # camera-to-world 4×4
+    pts_w:      np.ndarray,        # N×3  map points
+    kps:        Sequence[cv2.KeyPoint],
+    img_size:   Tuple[int, int],
+    search_rad: float = 8.0,
+    normals_w:  np.ndarray | None = None,     # optional (N×3)
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    """
+    ORB-SLAM-like projection search with a 2-D grid instead of brute-force.
+
+    1) *Frustum cull* + optional view-angle check.
+    2) Project surviving landmarks (vectorised).
+    3) Use the feature grid to fetch *candidate* key-points in O(1).
+    4) Choose the nearest candidate within `search_rad` px.
+
+    Returns 3-D/2-D correspondences **without duplicates**.
+    """
+    if pts_w.size == 0 or not kps:
+        return np.empty((0, 3)), np.empty((0, 2)), []
+
+    img_h, img_w = img_size
+    grid, cell_w, cell_h = _build_grid(kps, img_h, img_w)
+    kp_xy  = np.float32([kp.pt for kp in kps])           # K×2
+
+    # -------------------------------------------------- #
+    # 1. visibility + view-angle filter  (vectorised)
+    # -------------------------------------------------- #
+    T_c_w  = np.linalg.inv(pose_w_c)
+    R_c_w  = T_c_w[:3, :3]
+    t_c_w  = T_c_w[:3, 3]
+    pts_c  = (R_c_w @ pts_w.T + t_c_w[:, None]).T        # world → camera
+    z = pts_c[:, 2]
+    visible = (z > 0.1)                                   # in front of cam
+    if normals_w is not None:
+        view_cos = np.einsum('ij,ij->i', normals_w, pts_w - pose_w_c[:3, 3])
+        visible &= (view_cos / (np.linalg.norm(normals_w, axis=1) *
+                                 np.linalg.norm(pts_w - pose_w_c[:3, 3], axis=1)) > MIN_VIEW_COS)
+
+    pts_w = pts_w[visible]
+    pts_c = pts_c[visible]
+    if pts_w.size == 0:
+        return np.empty((0, 3)), np.empty((0, 2)), []
+
+    # -------------------------------------------------- #
+    # 2. project (vectorised)
+    # -------------------------------------------------- #
+    proj = (K @ pts_c.T).T
+    proj = (proj[:, :2] / proj[:, 2:]).astype(np.float32)   # N_vis×2
+
+    # restrict to image rectangle with a margin
+    inside = (proj[:, 0] >= 0) & (proj[:, 0] < img_w) & \
+             (proj[:, 1] >= 0) & (proj[:, 1] < img_h)
+    proj   = proj[inside]
+    pts_w  = pts_w[inside]
+
+    # -------------------------------------------------- #
+    # 3. grid lookup
+    # -------------------------------------------------- #
+    used_kp: set[int] = set()
+    out3d, out2d, out_kidx = [], [], []
+    r2 = search_rad ** 2
+    for pw, (u, v) in zip(pts_w, proj):
+        # which grid cells intersect the search circle?
+        min_c = int(max((u - search_rad) / cell_w, 0))
+        max_c = int(min((u + search_rad) / cell_w, GRID_COLS - 1))
+        min_r = int(max((v - search_rad) / cell_h, 0))
+        max_r = int(min((v + search_rad) / cell_h, GRID_ROWS - 1))
+
+        cand: list[int] = []
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                cand.extend(grid[r][c])
+        if not cand:
+            continue
+
+        cand = np.array(cand, dtype=int)
+        # squared distances only on *candidates*
+        d2 = np.sum((kp_xy[cand] - (u, v)) ** 2, axis=1)
+        idx = cand[np.argmin(d2)]
+        if d2.min() < r2 and idx not in used_kp:
+            out3d.append(pw)
+            out2d.append(kp_xy[idx])
+            out_kidx.append(idx)
+            used_kp.add(idx)
+
+    if not out3d:
+        return np.empty((0, 3)), np.empty((0, 2)), []
+
+    return np.float32(out3d), np.float32(out2d), out_kidx
+
+
+# --------------------------------------------------------------------------- #
+#  Continuous pose tracking (PnP) – FAST version
+# --------------------------------------------------------------------------- #
 def track_with_pnp(K,
-                   kp_prev, kp_cur, desc_prev, desc_cur, matches,
-                   frame_no,                    # global index of *current* frame
-                   Twc_prev,                    # pose for frame_no-1 (4×4)
+                   kp_prev, kp_cur, desc_prev, desc_cur, matches, img2,
+                   frame_no,                  # 1-based index of *current* frame
+                   Twc_prev,                  # pose for frame –1  (4×4)
                    world_map, args):
     """
-    Estimate T_wc for *current* frame using Perspective-n-Point.
+    Estimate the camera-to-world pose T_wc for *frame_no* using Perspective-n-Point
+    and already-triangulated landmarks.
 
     Returns
     -------
-    ok : bool
-    Twc_cur : (4,4) np.ndarray – pose camera-to-world for frame `frame_no`
-    used_cur_idx : set[int]    – kp indices on the current image that were
-                                  part of the inlier PnP solution.  These are
-                                  excluded from later triangulation.
+    ok           : bool
+    Twc_cur      : (4,4) np.ndarray – pose for the current frame
+    used_cur_idx : set[int]         – indices of key-points on *kp_cur* that
+                                      participated in the inlier PnP solution.
     """
-    # ----------------------------------------------------------
-    # 1) Gather 2-D/3-D correspondences            (X_w , u_v)
-    # ----------------------------------------------------------
-    obj_pts, img_pts, obj_pids, kp_cur_ids = [], [], [], []
-    prev_frame = frame_no - 1
+    import cv2
+    import numpy as np
+    from slam.core.pose_utils import _pose_rt_to_homogenous, _pose_inverse
 
-    for m in matches:
-        kp_prev_idx = m.queryIdx          # key-point index in previous frame
-        kp_cur_idx  = m.trainIdx          # key-point index in current frame
-
-        # See whether that previous key-point is an observation of a landmark
-        for pid, mp in world_map.points.items():
-            # mp.observations is a list of (frame_idx, kp_idx)
-            if any(f == prev_frame and k == kp_prev_idx for f, k, _ in mp.observations):
-                obj_pts.append(mp.position)          # ← 3-D point (world)
-                img_pts.append(kp_cur[kp_cur_idx].pt) # ← 2-D measurement
-                obj_pids.append(pid)
-                kp_cur_ids.append(kp_cur_idx)
-                break
-
-    if len(obj_pts) < args.pnp_min_inliers:
-        print(f"[PNP]  Not enough 2-D/3-D pairs: {len(obj_pts)} < {args.pnp_min_inliers}")
+    # ------------------------------------------------------------------ #
+    # 1. Build 3-D ↔ 2-D correspondences via projection-grid search
+    # ------------------------------------------------------------------ #
+    pts_w_all = world_map.get_point_array()          # (N,3)
+    pid_all   = world_map.point_ids()                # list length N
+    if pts_w_all.size == 0:
         return False, None, set()
 
-    obj_pts = np.ascontiguousarray(obj_pts, dtype=np.float32)
-    img_pts = np.ascontiguousarray(img_pts, dtype=np.float32)
+    img_h, img_w = img2.shape[:2]
+    GRID_ROWS, GRID_COLS = 48, 64                    # ≈13 px cells @ 640×480
+    cell_w, cell_h = img_w / GRID_COLS, img_h / GRID_ROWS
 
-    # ----------------------------------------------------------
-    # 2) PnP + RANSAC
-    # ----------------------------------------------------------
+    grid = [[[] for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
+    for idx, kp in enumerate(kp_cur):
+        c, r = int(kp.pt[0] / cell_w), int(kp.pt[1] / cell_h)
+        if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
+            grid[r][c].append(idx)
+
+    # ---- project all landmarks with *predicted* pose ------------------ #
+    Twc_pred = Twc_prev                                   # constant-motion prior
+    T_cw = np.linalg.inv(Twc_pred)
+    P = K @ T_cw[:3, :4]                                  # 3×4
+    pts_h = np.hstack([pts_w_all, np.ones((len(pts_w_all), 1))]).T
+    uvw = P @ pts_h                                       # 3×N (homogeneous)
+    proj = (uvw[:2] / uvw[2]).T.astype(np.float32)        # N×2  (u,v)
+
+    obj_pts, img_pts = [], []
+    obj_pids, kp_cur_ids = [], []
+    used_kp = set()
+    r2 = args.proj_radius ** 2
+
+    for i, (u, v) in enumerate(proj):
+        z = uvw[2, i]
+        if z <= 0:                                        # behind camera
+            continue
+        if not (0 <= u < img_w and 0 <= v < img_h):       # outside frame
+            continue
+
+        # which grid cells intersect the search circle?
+        min_c = int(max((u - args.proj_radius) / cell_w, 0))
+        max_c = int(min((u + args.proj_radius) / cell_w, GRID_COLS - 1))
+        min_r = int(max((v - args.proj_radius) / cell_h, 0))
+        max_r = int(min((v + args.proj_radius) / cell_h, GRID_ROWS - 1))
+
+        cand = []
+        for rr in range(min_r, max_r + 1):
+            for cc in range(min_c, max_c + 1):
+                cand.extend(grid[rr][cc])
+        if not cand:
+            continue
+
+        kp_xy = np.float32([kp_cur[j].pt for j in cand])
+        d2 = np.sum((kp_xy - (u, v)) ** 2, axis=1)
+        j_local = int(np.argmin(d2))
+        if d2[j_local] < r2:
+            kp_idx = cand[j_local]
+            if kp_idx in used_kp:
+                continue
+            obj_pts.append(pts_w_all[i])
+            img_pts.append(kp_xy[j_local])
+            obj_pids.append(pid_all[i])
+            kp_cur_ids.append(kp_idx)
+            used_kp.add(kp_idx)
+
+    if len(obj_pts) < args.pnp_min_inliers:
+        print(f"[PNP]  Not enough 3-D/2-D pairs ({len(obj_pts)}).")
+        return False, None, set()
+
+    obj_pts = np.asarray(obj_pts, np.float32)
+    img_pts = np.asarray(img_pts, np.float32)
+
+    # ------------------------------------------------------------------ #
+    # 2. Robust PnP  (EPnP + RANSAC → iterative refinement)
+    # ------------------------------------------------------------------ #
     ok, rvec, tvec, inl = cv2.solvePnPRansac(
         obj_pts, img_pts, K, None,
         iterationsCount=100,
@@ -251,86 +442,42 @@ def track_with_pnp(K,
         flags=cv2.SOLVEPNP_EPNP)
 
     if not ok or inl is None or len(inl) < args.pnp_min_inliers:
-        print(f"[PNP]  RANSAC failed – only {0 if inl is None else len(inl)} inliers")
+        print(f"[PNP]  RANSAC failed – {0 if inl is None else len(inl)} inliers")
         return False, None, set()
 
-    # camera-from-world  →  world-from-camera
-    R, _ = cv2.Rodrigues(rvec)
-    T_cw = _pose_rt_to_homogenous(R, tvec)
+    # optional refinement on inliers
+    inl = inl.reshape(-1)
+    cv2.solvePnP(obj_pts[inl], img_pts[inl], K, None,
+                 rvec, tvec, True, flags=cv2.SOLVEPNP_ITERATIVE)
+
+    # camera→world pose
+    R, _  = cv2.Rodrigues(rvec)
+    T_cw  = _pose_rt_to_homogenous(R, tvec)
     Twc_cur = _pose_inverse(T_cw)
 
-    # ----------------------------------------------------------
-    # 3) Register new 2-D observation for every inlier landmark
-    # ----------------------------------------------------------
-    inl = inl.ravel()
+    # ------------------------------------------------------------------ #
+    # 3. Map maintenance – add fresh observations
+    # ------------------------------------------------------------------ #
     for arr_idx, pid in enumerate(obj_pids):
-        if arr_idx in inl:                    # inlier test
+        if arr_idx in inl:                                 # inlier only
             kp_idx = kp_cur_ids[arr_idx]
-            world_map.points[pid].add_observation(frame_no, kp_idx, desc_cur[kp_idx])
+            world_map.points[pid].add_observation(frame_no,
+                                                   kp_idx,
+                                                   desc_cur[kp_idx])
 
     used_cur_idx = {kp_cur_ids[i] for i in inl}
     print(f"[PNP]  Pose @ frame {frame_no} refined with {len(inl)} inliers")
+
+    # ------------------------------------------------------------------ #
+    # 4. Visual debug (unchanged)
+    # ------------------------------------------------------------------ #
+    visualize_pnp_reprojection(
+        img2, K, Twc_cur,
+        obj_pts[inl], img_pts[inl],
+        inlier_mask=np.ones(len(inl), dtype=bool),
+        win_name="PnP reprojection")
+
     return True, Twc_cur, used_cur_idx
-
-
-def triangulate_new_points(K, pose_prev, pose_cur,
-                           kp_prev, kp_cur, matches,
-                           used_cur_idx, args, world_map, img_cur):
-    """Triangulate only *unmatched* keypoints and add them if baseline is good."""
-    fresh = [m for m in matches if m.trainIdx not in used_cur_idx]
-    if not fresh:
-        print("[TRIANGULATION] No new points to triangulate.")
-        return []
-
-    p0 = np.float32([kp_prev[m.queryIdx].pt for m in fresh])
-    p1 = np.float32([kp_cur[m.trainIdx].pt  for m in fresh])
-
-    # -- baseline / parallax test (ORB-SLAM uses θ ≈ 1°)
-    rel = _pose_inverse(pose_cur) @ pose_prev  # c₂ → c₁
-    R_rel, t_rel = rel[:3, :3], rel[:3, 3]
-    cos_thresh = np.cos(np.deg2rad(1.0))
-
-    rays0 = cv2.undistortPoints(p0.reshape(-1, 1, 2), K, None).reshape(-1, 2)
-    rays1 = cv2.undistortPoints(p1.reshape(-1, 1, 2), K, None).reshape(-1, 2)
-    rays0 = np.hstack([rays0, np.ones((len(rays0), 1))])
-    rays1 = np.hstack([rays1, np.ones((len(rays1), 1))])
-
-    ang_ok = np.einsum('ij,ij->i', rays0, (R_rel @ rays1.T).T) < cos_thresh
-    if not ang_ok.any():
-        print("[TRIANGULATION] No points passed the parallax test.")
-        return []
-
-    p0, p1 = p0[ang_ok], p1[ang_ok]
-    fresh  = [m for m, keep in zip(fresh, ang_ok) if keep]
-
-    pts3d = triangulate_points(K, R_rel, t_rel, p0, p1)
-    z = pts3d[:, 2]
-    depth_ok = (z > args.min_depth) & (z < args.max_depth)
-    pts3d = pts3d[depth_ok]
-    fresh  = [m for m, keep in zip(fresh, depth_ok) if keep]
-
-    if not len(pts3d):
-        print("[TRIANGULATION] No points passed the depth test.")
-        return []
-
-    # colour sampling
-    h, w, _ = img_cur.shape
-    pix = [kp_cur[m.trainIdx].pt for m in fresh]
-    cols = []
-    for (u, v) in pix:
-        x, y = int(round(u)), int(round(v))
-        if 0 <= x < w and 0 <= y < h:
-            b, g, r = img_cur[y, x]
-            cols.append((r, g, b))
-        else:
-            cols.append((255, 255, 255))
-    cols = np.float32(cols) / 255.0
-
-    pts3d_w = pose_prev @ np.hstack([pts3d, np.ones((len(pts3d), 1))]).T
-    pts3d_w = pts3d_w.T[:, :3]
-    ids = world_map.add_points(pts3d_w, cols, keyframe_idx=len(world_map.poses)-1)
-    print(f"[TRIANGULATION] Added {len(ids)} new landmarks.")
-    return ids
 
 
 # --------------------------------------------------------------------------- #
@@ -375,12 +522,12 @@ def main():
 
     world_map = Map()
     Twc_cur_pose = np.eye(4)  # camera‑to‑world (identity at t=0)
-    world_map.add_pose(Twc_cur_pose)
+    world_map.add_pose(Twc_cur_pose, is_keyframe=True)  # initial pose
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
     plot2d = TrajectoryPlotter()           
 
     kfs: list[Keyframe] = []
-    last_kf_idx = -999
+    last_kf_frame_no = -999
 
     # TODO FOR BUNDLE ADJUSTMENT
     frame_keypoints: List[List[cv2.KeyPoint]] = []  #CHANGE
@@ -414,27 +561,30 @@ def main():
             print(f"[WARN] Not enough matches at frame {i}. Skipping.")
             continue
         
+        # ---------------- 2D - Feature Tracking --------------------------
         frame_no = i + 1
         curr_map, tracks, next_track_id = update_and_prune_tracks(
                 matches, prev_map, tracks, kp2, frame_no, next_track_id)
         prev_map = curr_map                       # for the next iteration
 
         # ---------------- Key-frame decision -------------------------- # TODO make every frame a keyframe
-        frame_keypoints.append(kp2)
+        
         if i == 0:
-            kfs.append(Keyframe(0, seq[0] if isinstance(seq[0], str) else "",
-                        kp1, des1, Twc_cur_pose, make_thumb(img1, tuple(args.kf_thumb_hw))))
-            last_kf_idx = 0
+            kfs.append(Keyframe(idx=0, frame_idx=1, path=seq[0] if isinstance(seq[0], str) else "",
+                        kps=kp1, desc=des1, pose=Twc_cur_pose, thumb=make_thumb(img1, tuple(args.kf_thumb_hw))))
+            last_kf_frame_no = kfs[-1].frame_idx
             prev_len = len(kfs)
             is_kf = False
             continue
         else:
             prev_len = len(kfs)
-            kfs, last_kf_idx = select_keyframe(
-                args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_idx)
+            kfs, last_kf_frame_no = select_keyframe(
+                args, seq, i, img2, kp2, des2, Twc_cur_pose, matcher, kfs, last_kf_frame_no)
             is_kf = len(kfs) > prev_len
-
-        print("len(kfs) = ", len(kfs), "last_kf_idx = ", last_kf_idx)
+        
+        if is_kf:
+            frame_keypoints.append(kp2.copy())
+        # print("len(kfs) = ", len(kfs), "last_kf_frame_no = ", last_kf_frame_no)
         # ------------------------------------------------ bootstrap ------------------------------------------------ # TODO FIND A BETTER WAY TO manage index
         if not initialised:
             if len(kfs) < 2:
@@ -443,8 +593,8 @@ def main():
             bootstrap_matches = filter_matches_ransac(kfs[0].kps, kfs[-1].kps, bootstrap_matches, args.ransac_thresh)
             ok, Twc_temp_pose = try_bootstrap(K, kfs[0].kps, kfs[0].desc, kfs[-1].kps, kfs[-1].desc, bootstrap_matches, args, world_map)
             if ok:
-                frame_keypoints[0] = kfs[0].kps        # BA (img1 is frame-0)
-                frame_keypoints[-1] = kfs[-1].kps        # BA (img2 is frame-1)
+                frame_keypoints[0] = kfs[0].kps.copy()    # BA (img1 is frame-0)
+                frame_keypoints[-1] = kfs[-1].kps.copy()        # BA (img2 is frame-1)
                 # print("POSES: " ,world_map.poses)
                 # two_view_ba(world_map, K, frame_keypoints, max_iters=25) # BA
 
@@ -460,7 +610,7 @@ def main():
         # ok_pnp, Twc_cur_pose, used_idx = solve_pnp_step(
         #     K, Twc_pose_pred, world_map, kp2, args) # kp2 is the current frame keypoints
         ok_pnp, Twc_cur_pose, used_idx = track_with_pnp(K, kp1, kp2, des1, des2, matches,
-                                                        frame_no=i + 1,
+                                                        frame_no=i + 1, img2=img2,
                                                         Twc_prev=Twc_cur_pose,        # pose from the *previous* iteration
                                                         world_map=world_map,
                                                         args=args)
@@ -489,16 +639,18 @@ def main():
             Twc_cur_pose = last_kf.pose @ np.linalg.inv(T_rel)   # c₂ → world
             tracking_lost = False
 
-        world_map.add_pose(Twc_cur_pose)        # always push *some* pose
+        if is_kf:
+            world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)        # always push *some* pose
 
         # pose_only_ba(world_map, K, frame_keypoints,    # FOR BA
             #  frame_idx=len(world_map.poses)-1)
 
         # ------------------------------------------------ map growth ------------------------------------------------
-        if is_kf:
+        if  is_kf:
             # 1) hand the new KF to the multi-view triangulator
+            kf_pose_idx = len(world_map.poses) - 1       # this is the new pose’s index
             mvt.add_keyframe(
-                frame_idx=frame_no,            # global frame number of this KF
+                frame_idx=kf_pose_idx,            # global frame number of this KF
                 Twc_pose=Twc_cur_pose,
                 kps=kp2,
                 track_map=curr_map,
@@ -511,17 +663,21 @@ def main():
             # 3) visualisation hook
             new_ids = new_mvt_ids                # keeps 3-D viewer in sync
 
+        # ------------------------------------------------ Local Bundle Adjustment ------------------------------------------------
+        # if is_kf and (len(kfs) % args.local_ba_window == 0): # or len(world_map.keyframe_indices) > args.local_ba_window
+        #     pose_prev = Twc_cur_pose.copy()
+        #     center_kf_idx = kfs[-1].idx
+        #     print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
+        #     print(f'len keyframes = {len(kfs)}, len frame_keypoints = {len(frame_keypoints)}, len poses = {len(world_map.poses)}')
+        #     # print(f"world_map.poses = {len(world_map.poses)}, \n raw: {world_map.poses} \n keyframe_indices= {len(world_map.keyframe_indices)},\n raw: {world_map.keyframe_indices}")
+        #     local_bundle_adjustment(
+        #         world_map, K, frame_keypoints,
+        #         center_kf_idx=len(world_map.poses) - 1,
+        #         window_size=args.local_ba_window)
 
-            # pose_prev = cur_pose.copy()
-
-            # local_bundle_adjustment(
-            #     world_map, K, frame_keypoints,
-            #     center_kf_idx=last_kf_idx,
-            #     window_size=8 )
-
-        p = Twc_cur_pose[:3, 3]
-        p_gt = gt_T[i + 1, :3, 3]
-        print(f"Cam position z = {p}, GT = {p_gt}  (should decrease on KITTI)")
+        # p = Twc_cur_pose[:3, 3]
+        # p_gt = gt_T[i + 1, :3, 3]
+        # print(f"Cam position z = {p}, GT = {p_gt}  (should decrease on KITTI)")
 
         # --- 2-D path plot (cheap) ----------------------------------------------
         est_pos = Twc_cur_pose[:3, 3]
