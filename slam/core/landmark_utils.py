@@ -22,6 +22,24 @@ import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
+# datatype test for feature descriptors
+def _canon_desc(desc):
+    try:
+        import torch
+        if isinstance(desc, torch.Tensor):
+            desc = desc.detach().to("cpu")
+            if desc.dtype != torch.uint8:
+                desc = desc.float()
+            desc = desc.contiguous().numpy()
+    except Exception:
+        pass
+    d = np.asarray(desc)
+    if d.dtype == np.uint8:                 # ORB/AKAZE (binary)
+        return d.reshape(-1)
+    d = d.astype(np.float32, copy=False)    # ALIKE/LightGlue (float)
+    n = np.linalg.norm(d) + 1e-8
+    return (d / n).reshape(-1)
+
 # --------------------------------------------------------------------------- #
 #  MapPoint
 # --------------------------------------------------------------------------- #
@@ -53,7 +71,7 @@ class MapPoint:
 
     def add_observation(self, keyframe_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
         """Register that *kp_idx* in *keyframe_idx* observes this landmark."""
-        self.observations.append((keyframe_idx, kp_idx, descriptor))
+        self.observations.append((keyframe_idx, kp_idx, _canon_desc(descriptor)))
 
 
 # --------------------------------------------------------------------------- #
@@ -69,10 +87,10 @@ class Map:
         self._next_pid: int = 0
 
     # ---------------- Camera trajectory ---------------- #
-    def add_pose(self, pose_w_c: np.ndarray, is_keyframe: bool) -> None:
-        """Append a 4×4 *pose_w_c* (camera‑to‑world) to the trajectory."""
-        assert pose_w_c.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
-        self.poses.append(pose_w_c.copy())
+    def add_pose(self, pose_c_w: np.ndarray, is_keyframe: bool) -> None:
+        """Append a 4×4 *pose_c_w* (camera‑to‑world) to the trajectory.""" ## CHANGED TO CAMERA-FROM-WORLD
+        assert pose_c_w.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
+        self.poses.append(pose_c_w.copy())
         if is_keyframe:
             self.keyframe_indices.append(len(self.poses) - 1)
 
