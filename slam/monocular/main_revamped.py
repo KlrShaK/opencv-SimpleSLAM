@@ -45,7 +45,7 @@ from slam.core.keyframe_utils import (
     select_keyframe, 
     make_thumb)
 
-from slam.core.visualization_utils import draw_tracks, Visualizer3D, TrajectoryPlotter
+from slam.core.visualization_utils import draw_tracks, Visualizer3D, Trajectory2D, VizUI
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map
 from slam.core.triangulation_utils import MultiViewTriangulator
@@ -104,6 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=['kitti', 'malaga', 'tum-rgbd', 'custom'],
                    required=True)
     p.add_argument('--base_dir', default='../Dataset')
+
     # feature/detector settings
     p.add_argument('--detector', choices=['orb', 'sift', 'akaze'],
                    default='orb')
@@ -113,17 +114,24 @@ def _build_parser() -> argparse.ArgumentParser:
                    help='Minimum LightGlue confidence for a match')
     # runtime
     p.add_argument('--fps', type=float, default=10)
+
     # RANSAC
     p.add_argument('--ransac_thresh', type=float, default=3.0)
+
     # key-frame params
     p.add_argument('--kf_max_disp', type=float, default=45)
     p.add_argument('--kf_min_inliers', type=float, default=150)
+    p.add_argument('--kf_min_ratio', type=float, default=0.35,
+               help='Min inlier ratio (to prev KF kps) before promoting KF')
+    p.add_argument('--kf_min_rot_deg', type=float, default=8.0,
+               help='Min rotation (deg) wrt prev KF to trigger KF')
     p.add_argument('--kf_cooldown', type=int, default=5)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2,
                    default=[640, 360])
     
     # 3‑D visualisation toggle
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D visualization window")
+    
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.40)
     p.add_argument("--max_depth", type=float, default=100.0)
@@ -185,9 +193,11 @@ def main():
     # --- World Map Initialization ---
     world_map = Map()
     Tcw_cur_pose = np.eye(4)  # camera-from-world (identity at t=0)
-    # world_map.add_pose(Tcw_cur_pose, is_keyframe=True)  # initial pose
+
+    # --- Visualization  ---
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
-    plot2d = TrajectoryPlotter()  
+    traj2d = Trajectory2D(gt_T_list=gt_T if groundtruth is not None else None)
+    ui = VizUI()  # p: pause/resume, n: step, q/Esc: quit
 
     # --- Keyframe Initialization ---
     kfs: list[Keyframe] = []
@@ -201,13 +211,13 @@ def main():
     total = len(seq) - 1
 
     for i in tqdm(range(total), desc='Tracking'):
+
         # --- load image pair ---
         img1, img2 = load_frame_pair(args, seq, i)
 
         # --- feature extraction / matching ---
         kp1, des1 = feature_extractor(args, img1, detector)
         kp2, des2 = feature_extractor(args, img2, detector)
-
 
         # --------------------------------------------------------------------------- #
         # ------------------------ Bootstrap (delayed two-view) ------------------------------------------------
@@ -264,6 +274,10 @@ def main():
             # -------------BOOKKEEPING for Map and Keyframes---------------------
             world_map.add_pose(T0_cw, is_keyframe=True)   # KF0
             world_map.add_pose(T1_cw, is_keyframe=True)   # KF1
+
+            # --- 2D Trajectory visualization bookkeeping ---
+            traj2d.push(bs.frame_id_ref, T0_cw)
+            traj2d.push(i + 1,          T1_cw)
             
             # --- Create the two initial Keyframes to mirror world_map KFs ---
             try:
@@ -342,14 +356,18 @@ def main():
                 if Tcw_est is not None and ninl >= int(args.pnp_min_inliers):
                     Tcw_cur_pose = Tcw_est
                     world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+
+                    # --- 2D Trajectory visualization bookkeeping ---
+                    traj2d.push(i + 1, Tcw_cur_pose)
+
                     log.info(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
 
                     # Optional: quick visual sanity overlay (comment out if headless)
                     try:
                         dbg = draw_reprojection_debug(img2, K, Tcw_cur_pose, m23d, inl_mask)
                         cv2.imshow("Track debug", dbg)
-                        if cv2.waitKey(int(1000.0/max(args.fps, 1e-6))) == 27:
-                            break
+                        # if cv2.waitKey(int(1000.0/max(args.fps, 1e-6))) == 27:
+                        #     break # TODO REMOVE
                     except Exception:
                         pass
 
@@ -367,9 +385,45 @@ def main():
                 tracking_lost = True
 
             # (Optional) if tracking_lost: trigger relocalization here in the future.
-            continue
+        # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
+        
+        
+        # ------------------------------------------------------------------- #
+        # ---------------------     Keyframe Selection  --------------------- #
+        # ------------------------------------------------------------------- #
+        prev_len = len(kfs)
+        kfs, last_kf_frame_no = select_keyframe(
+            args, seq, i, img2, kp2, des2, Tcw_cur_pose, matcher, kfs, last_kf_frame_no
+        )
+        is_kf = (len(kfs) > prev_len)
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
+
+
+
+        # --------------------------------------MISCELLANEOUS INFO ---------------------------------------------------
+        print(f"[traj2d] est={len(traj2d.est_xyz)} gt={len(traj2d.gt_xyz)}")
+        print(f"Frame {i+1}/{total}  |  FPS: {achieved_fps:.1f}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
+        # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
+
+        
+        # ------------------------------------------------------------------- #
+        # --------------------- Visualization ----------------------- #
+        # ------------------------------------------------------------------- #
+        # --- draw & UI control (end of iteration) ---
+        traj2d.draw(paused=ui.paused)
+
+        ui.poll(1)  # non-blocking poll
+        if ui.should_quit():
+            break
+
+        # If currently paused: block here until resume or do single-step
+        if ui.paused:
+            did_step = ui.wait_if_paused()
+            # if user pressed 'n', did_step=True -> allow this iteration to exit;
+            # next iteration will immediately pause again (nice for stepping).
+        # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
+        
 
 if __name__ == '__main__':
     main()
