@@ -106,6 +106,7 @@ def _desc_distance(a, b, metric="auto"):
     b = b.astype(np.float32, copy=False)
     return float(np.linalg.norm(a - b))
 
+# TODO Optimal way would be to add a parameter to class map_point that keeps a running average of descriptor(Also know as reference descriptor)
 def _best_mp_distance_to_cur_desc(mp, d_cur, max_obs_check: int = 6) -> float:
     """Return the smallest distance between the current descriptor and any
     of the map point's stored observation descriptors (check last N)."""
