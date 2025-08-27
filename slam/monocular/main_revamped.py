@@ -48,13 +48,13 @@ from slam.core.keyframe_utils import (
 from slam.core.visualization_utils import draw_tracks, Visualizer3D, Trajectory2D, VizUI
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map
-from slam.core.triangulation_utils import MultiViewTriangulator
 
 import logging
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s") # INFO for clean summary, DEBUG for deep dive
 # logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
-logging.getLogger("pnp").setLevel(logging.DEBUG)
+# logging.getLogger("pnp").setLevel(logging.DEBUG)
 # logging.getLogger("multi_view").setLevel(logging.DEBUG)
+logging.getLogger("triangulation").setLevel(logging.DEBUG)
 log = logging.getLogger("main")
 
 
@@ -71,6 +71,13 @@ from slam.core.pnp_utils import (
     solve_pnp_ransac,
     draw_reprojection_debug
 )
+
+from slam.core.triangulation_utils import (
+    triangulate_between_kfs_2view
+)
+
+from slam.core.ba_utils import pose_only_ba, local_bundle_adjustment
+
 
 class BootstrapState:
         def __init__(self):
@@ -116,7 +123,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--fps', type=float, default=10)
 
     # RANSAC
-    p.add_argument('--ransac_thresh', type=float, default=3.0)
+    p.add_argument('--ransac_thresh', type=float, default=2.5)
 
     # key-frame params
     p.add_argument('--kf_max_disp', type=float, default=45)
@@ -131,11 +138,11 @@ def _build_parser() -> argparse.ArgumentParser:
     
     # 3‑D visualisation toggle
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D visualization window")
-    
+
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.40)
     p.add_argument("--max_depth", type=float, default=100.0)
-    p.add_argument('--mvt_rep_err', type=float, default=30.0,
+    p.add_argument('--mvt_rep_err', type=float, default=2.0,
                help='Max mean reprojection error (px) for multi-view triangulation')
 
     #  PnP / map-maintenance
@@ -174,13 +181,7 @@ def main():
     # --- feature pipeline (OpenCV / LightGlue) ---
     detector, matcher = init_feature_pipeline(args)
 
-    mvt = MultiViewTriangulator(
-        K,
-        min_views=3,                             # ← “every 3 key-frames”
-        merge_radius=args.merge_radius,
-        max_rep_err=args.mvt_rep_err,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth)
+
     
     bs = BootstrapState()
 
@@ -310,6 +311,12 @@ def main():
                 last_kf_frame_no = cur_fidx   # the most recently added keyframe
                 log.info("[Init] Inserted initial keyframes: KF0(frame=%d, idx=%d) & KF1(frame=%d, idx=%d).",
                         ref_fidx, kf0_idx, cur_fidx, kf1_idx)
+
+
+                # and also seed their mutual matches (helps get first 3-view tracks quickly)
+                raw01 = feature_matcher(args, kfs[0].kps, kfs[1].kps, kfs[0].desc, kfs[1].desc, matcher)
+                # --- END --- 
+
             except Exception as e:
                 log.exception("[Init] Failed to create initial keyframes: %s", e)
 
@@ -371,12 +378,6 @@ def main():
                     except Exception:
                         pass
 
-                    # (Optional) Decide on promoting to a Keyframe
-                    #   (you already have selector; pose2 can be Tcw_cur_pose or None)
-                    # kfs, last_kf_frame_no = select_keyframe(
-                    #     args, seq, i, img2, kp2, des2, Tcw_cur_pose, matcher, kfs, last_kf_frame_no
-                    # )
-
                 else:
                     log.warning(f"[Track] PnP failed or too few inliers (got {ninl}). Tracking lost?")
                     tracking_lost = True
@@ -398,7 +399,40 @@ def main():
         is_kf = (len(kfs) > prev_len)
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
+        # ------------------------------------------------------------------- #
+        # --------------------- Map Growth (Triangulation) --------------------- #
+        # ------------------------------------------------------------------- #
+        if is_kf and len(kfs) >= 2:
+            prev_kf = kfs[-2]
+            curr_kf = kfs[-1]
+            new_ids = triangulate_between_kfs_2view(
+                args, K, world_map, prev_kf, curr_kf, matcher, log,
+                use_parallax_gate=True, parallax_min_deg=2.0,
+                reproj_px_max=float(args.ransac_thresh)
+            )
+            if new_ids:
+                log.info("[Map] Triangulated %d new points after KF %d.", len(new_ids), curr_kf.idx)
 
+                # TODO pose only BA should happen on every tracking frame and not here, but well, if it works we don't touch it
+                # --- BA pass 1: fast pose-only BA on current KF (uses its own obs) ---
+                try:
+                    pose_only_ba(world_map, K, kfs, kf_idx=curr_kf.idx, max_iters=8, huber_thr=2.0)
+                except Exception as e:
+                    log.warning(f"[BA] Pose-only BA failed: {e}")
+
+                # --- BA pass 2: local BA on a small KF window ---
+                try:
+                    local_bundle_adjustment(
+                        world_map, K, kfs,
+                        center_kf_idx=curr_kf.idx,
+                        window_size=int(getattr(args, "local_ba_window", 6)),
+                        max_points=10000,
+                        max_iters=15
+                    )
+                except Exception as e:
+                    log.warning(f"[BA] Local BA failed: {e}")
+
+        # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
 
         # --------------------------------------MISCELLANEOUS INFO ---------------------------------------------------
