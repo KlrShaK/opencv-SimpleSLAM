@@ -22,6 +22,24 @@ import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
+# datatype test for feature descriptors
+def _canon_desc(desc):
+    try:
+        import torch
+        if isinstance(desc, torch.Tensor):
+            desc = desc.detach().to("cpu")
+            if desc.dtype != torch.uint8:
+                desc = desc.float()
+            desc = desc.contiguous().numpy()
+    except Exception:
+        pass
+    d = np.asarray(desc)
+    if d.dtype == np.uint8:                 # ORB/AKAZE (binary)
+        return d.reshape(-1)
+    d = d.astype(np.float32, copy=False)    # ALIKE/LightGlue (float)
+    n = np.linalg.norm(d) + 1e-8
+    return (d / n).reshape(-1)
+
 # --------------------------------------------------------------------------- #
 #  MapPoint
 # --------------------------------------------------------------------------- #
@@ -41,7 +59,7 @@ class MapPoint:
         RGB colour (linear, 0‑1) associated with the point (shape ``(3,)``).
     observations
         List of observations in the form ``(frame_idx, kp_idx, descriptor)`` where
-        * ``frame_idx`` – index of the frame where the keypoint was detected.
+        * ``keyframe_idx`` – Keyframe - idx where the keypoint was detected.
         * ``kp_idx``    – index of the keypoint inside that frame.
         * ``descriptor`` – feature descriptor as a 1‑D ``np.ndarray``.
     """
@@ -49,11 +67,11 @@ class MapPoint:
     position: np.ndarray  # shape (3,)
     keyframe_idx: int = -1
     colour: np.ndarray = field(default_factory=lambda: np.ones(3, dtype=np.float32))    # (3,) in **linear** RGB 0-1
-    observations: List[Tuple[int, int, np.ndarray]] = field(default_factory=list)  # (frame_idx, kp_idx, descriptor)
+    observations: List[Tuple[int, int, np.ndarray]] = field(default_factory=list)  # (keyframe_idx, kp_idx, descriptor)
 
-    def add_observation(self, frame_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
-        """Register that *kp_idx* in *frame_idx* observes this landmark."""
-        self.observations.append((frame_idx, kp_idx, descriptor))
+    def add_observation(self, keyframe_idx: int, kp_idx: int, descriptor: np.ndarray) -> None:
+        """Register that *kp_idx* in *keyframe_idx* observes this landmark."""
+        self.observations.append((keyframe_idx, kp_idx, _canon_desc(descriptor)))
 
 
 # --------------------------------------------------------------------------- #
@@ -64,17 +82,17 @@ class Map:
 
     def __init__(self) -> None:
         self.points: Dict[int, MapPoint] = {}
-        self.keyframe_indices: set[int] = set()
+        self.keyframe_indices: List[int] = []
         self.poses: List[np.ndarray] = []  # List of 4×4 camera‑to‑world matrices (World-from-Camera)
         self._next_pid: int = 0
 
     # ---------------- Camera trajectory ---------------- #
-    def add_pose(self, pose_w_c: np.ndarray, is_keyframe: bool) -> None:
-        """Append a 4×4 *pose_w_c* (camera‑to‑world) to the trajectory."""
-        assert pose_w_c.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
-        self.poses.append(pose_w_c.copy())
+    def add_pose(self, pose_c_w: np.ndarray, is_keyframe: bool) -> None:
+        """Append a 4×4 *pose_c_w* (camera‑to‑world) to the trajectory.""" ## CHANGED TO CAMERA-FROM-WORLD
+        assert pose_c_w.shape == (4, 4), "Pose must be 4×4 homogeneous matrix"
+        self.poses.append(pose_c_w.copy())
         if is_keyframe:
-            self.keyframe_indices.add(len(self.poses) - 1)
+            self.keyframe_indices.append(len(self.poses) - 1)
 
     # ---------------- Landmarks ------------------------ #
     def add_points(self, pts3d: np.ndarray, colours: Optional[np.ndarray] = None,
