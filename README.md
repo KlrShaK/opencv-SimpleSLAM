@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/f489a554-299e-41ad-a4b4-436e32d8cbd5
 
-### Preface
+## Preface
 This project was was done for **OpenCV** under the guidance of *Gary Bradski* and *Reza Amayeh* supported by **Google Summer of Code(GSOC) 2025**. This project presents a methodological approach to designing, implementing, and documenting a **Simultaneous Localization and Mapping(SLAM) framework from scratch in Python**. The primary objective is to build a fully functional, OpenCV-based SLAM system with clear documentation to facilitate reproducibility, future extensions, and adoption by the broader computer vision community. Traditional SLAM systems that rely on hand-crafted features (e.g., ORB, SIFT) often exhibit reduced robustness under challenging conditions such as viewpoint shifts, illumination changes, or motion blur. To address these limitations, we integrate modern learned features—ALIKED keypoints and descriptors *(Zhao et al., 2022)* combined with the LightGlue matcher *(Lindenberger et al., 2023)*—into a streamlined SLAM pipeline. This integration improves tracking stability and relocalization performance, especially in environments with significant photometric and geometric variations.
 
 In addition, the system **extends feature extraction and matching using [LightGlue](https://github.com/cvg/LightGlue)** *(Lindenberger et al., 2023)* and leverages **[PyCeres](https://github.com/cvg/pyceres)** for non-linear optimization, enabling efficient **bundle adjustment and graph optimization** within the pipeline.
