@@ -176,3 +176,6 @@ cython_debug/
 
 # ignore datasets
 /Dataset
+
+# ignore backup code folder
+/slam_(copy)/

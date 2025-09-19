@@ -19,6 +19,7 @@ but adds `--no_viz3d` to disable the 3‑D window.
 
 """
 import argparse
+from copy import deepcopy
 import cv2
 import lz4.frame
 import numpy as np
@@ -166,9 +167,15 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
     # add (frame_idx , kp_idx) pairs for each new MP
     # -----------------------------------------------
     inlier_kp_idx = np.where(mask)[0][ok]   # kp indices that survived depth
-    for pid, kp_idx in zip(ids, inlier_kp_idx):
-        world_map.points[pid].add_observation(0, kp_idx, descs0[kp_idx])   # img0 side
-        world_map.points[pid].add_observation(1, kp_idx, descs1[kp_idx])   # img1 side
+    # build index arrays once
+    qidx = np.int32([m.queryIdx for m in matches])
+    tidx = np.int32([m.trainIdx for m in matches])
+    sel  = np.where(mask)[0][ok]            # selected matches
+
+    for pid, i0, i1 in zip(ids, qidx[sel], tidx[sel]):
+        world_map.points[pid].add_observation(0, i0, descs0[i0])
+        world_map.points[pid].add_observation(1, i1, descs1[i1])
+
 
 
     print(f"[BOOTSTRAP] Map initialised with {len(ids)} landmarks.")
@@ -259,6 +266,34 @@ def track_with_pnp(K,
     proj_px = project_points(K, Twc_prev, pts_w)               # (N,2)
     kp_xy   = np.float32([kp.pt for kp in kp_cur])             # (K,2)
 
+    # -------------------- 1a) Hard gates before NN association --------------------
+    # World → previous camera coordinates
+    T_cw = np.linalg.inv(Twc_prev)
+    R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
+    Xc = (R_cw @ pts_w.T + t_cw[:, None]).T          # (N,3) in camera frame
+    z  = Xc[:, 2]
+
+    H, W = img2.shape[:2]
+    margin     = float(getattr(args, "proj_margin", 2.0))      # px
+    min_depth  = float(getattr(args, "min_depth", 0.1))        # m
+    max_depth  = float(getattr(args, "max_depth", np.inf))     # m
+
+    u, v = proj_px[:, 0], proj_px[:, 1]
+    valid_depth = (z > min_depth) & (z < max_depth)
+    valid_pix   = np.isfinite(u) & np.isfinite(v) & \
+                  (u >= margin) & (u < W - margin) & \
+                  (v >= margin) & (v < H - margin)
+
+    keep = np.where(valid_depth & valid_pix)[0]
+    if keep.size < 4:
+        print(f"[PNP] Too few gated points (keep={keep.size}) at frame {frame_no}")
+        return False, None, set()
+
+    # shrink arrays to only gated landmarks
+    pts_w   = pts_w[keep]
+    proj_px = proj_px[keep]
+    mp_ids  = [mp_ids[i] for i in keep]
+
     def _associate(search_rad_px: float):
         used_kp = set()
         obj_pts, img_pts = [], []
@@ -314,13 +349,13 @@ def track_with_pnp(K,
         print(f"[PNP] Too few inliers after refine ({num_inl}<{args.pnp_min_inliers}) at frame {frame_no}")
         return False, None, set()
 
-    # -------------------- 4) Bookkeeping: add observations --------------------
-    used_cur_idx = set()
-    for ok, pid, kp_idx in zip(inlier_mask, obj_pids, kp_ids):
-        if not ok:
-            continue
-        world_map.points[pid].add_observation(frame_no, kp_idx, desc_cur[kp_idx])
-        used_cur_idx.add(kp_idx)
+    # # -------------------- 4) Bookkeeping: add observations --------------------
+    # used_cur_idx = set()
+    # for ok, pid, kp_idx in zip(inlier_mask, obj_pids, kp_ids):
+    #     if not ok:
+    #         continue
+    #     world_map.points[pid].add_observation(frame_no, kp_idx, desc_cur[kp_idx]) # TODO change frame_no
+    #     used_cur_idx.add(kp_idx)
 
     print(f"[PNP] Pose @ frame {frame_no} refined with {num_inl} inliers")
 
@@ -333,8 +368,7 @@ def track_with_pnp(K,
         win_name="PnP reprojection"
     )
     # print(f"[PNP]  Pose @ frame {frame_no} refined with {len(inlier_mask)} inliers")
-    return True, Twc_cur, used_cur_idx
-
+    return True, Twc_cur, (obj_pids, kp_ids, inlier_mask)
 
 # --------------------------------------------------------------------------- #
 #  Main processing loop
@@ -417,7 +451,7 @@ def main():
             print(f"[WARN] Not enough matches at frame {i}. Skipping.")
             continue
         
-        # ---------------- 2D - Feature Tracking --------------------------
+        # ---------------- 2D - Feature Tracking -------------------------- # TODO should be done every keyframe maybe thats why we are having issues with BA
         frame_no = i + 1
         curr_map, tracks, next_track_id = update_and_prune_tracks(
                 matches, prev_map, tracks, kp2, frame_no, next_track_id)
@@ -466,11 +500,12 @@ def main():
         # print(f'pose before PnP: {Twc_cur_pose}')         
         # ok_pnp, Twc_cur_pose, used_idx = solve_pnp_step(
         #     K, Twc_pose_pred, world_map, kp2, args) # kp2 is the current frame keypoints
-        ok_pnp, Twc_cur_pose, used_idx = track_with_pnp(K, kp1, kp2, des1, des2, matches,
+        ok_pnp, Twc_cur_pose, assoc = track_with_pnp(K, kp1, kp2, des1, des2, matches,
                                                         frame_no=i + 1, img2=img2,
                                                         Twc_prev=Twc_pose_prev,        # pose from the *previous* iteration
                                                         world_map=world_map,
                                                         args=args)
+
 
         if True:                      # fallback to 2-D-2-D if PnP failed
             print(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
@@ -496,7 +531,14 @@ def main():
             tracking_lost = False
 
         if is_kf:
-            world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)        # always push *some* pose
+            world_map.add_pose(Twc_cur_pose, is_keyframe=is_kf)
+            if ok_pnp and assoc is not None:
+                obj_pids, kp_ids, inlier_mask = assoc
+                kf_idx = len(world_map.poses) - 1   # index of the newly added KF
+                for ok, pid, kp_idx in zip(inlier_mask, obj_pids, kp_ids):
+                    if ok:
+                        world_map.points[pid].add_observation(kf_idx, kp_idx, des2[kp_idx])
+
 
         # pose_only_ba(world_map, K, frame_keypoints,    # FOR BA
         #      frame_idx=len(world_map.poses)-1)
@@ -524,12 +566,23 @@ def main():
             pose_prev = Twc_cur_pose.copy()
             center_kf_idx = kfs[-1].idx
             print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window}) , current = {len(world_map.poses) - 1}")
-            print(f'len keyframes = {len(kfs)}, len frame_keypoints = {len(frame_keypoints)}, len poses = {len(world_map.poses)}')
-            print(f"world_map.poses = {len(world_map.poses)}, \n raw: {world_map.poses} \n keyframe_indices= {len(world_map.keyframe_indices)},\n raw: {world_map.keyframe_indices}")
+            # print(f'len keyframes = {len(kfs)}, len frame_keypoints = {len(frame_keypoints)}, len poses = {len(world_map.poses)}')
+            # print(f"world_map.poses = {len(world_map.poses)}, \n raw: {world_map.poses} \n keyframe_indices= {len(world_map.keyframe_indices)},\n raw: {world_map.keyframe_indices}")
+            # --- before BA -----------------------------------------------------------
+            from slam.core.visualize_ba import visualize_ba_window
+            world_map_before = deepcopy(world_map)      # <—— new
             local_bundle_adjustment(
                 world_map, K, frame_keypoints,
                 center_kf_idx=len(world_map.poses) - 1,
                 window_size=args.local_ba_window)
+            
+            first_opt = max(1, center_kf_idx - args.local_ba_window + 1)
+            opt_kf    = list(range(first_opt, center_kf_idx + 1))
+            # visualize_ba_window(seq, args,
+            #         K,
+            #         world_map_before, world_map,     # before / after maps
+            #         frame_keypoints,
+            #         opt_kf)          # list of key-frame indices
 
         # p = Twc_cur_pose[:3, 3]
         # p_gt = gt_T[i + 1, :3, 3]

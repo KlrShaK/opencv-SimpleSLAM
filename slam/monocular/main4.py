@@ -1,18 +1,17 @@
 # main.py
 """
-WITH MULTI-VIEW TRIANGULATION + Keyframe Track Visualizations
+Monocular VO/SLAM main with:
+  • PnP tracking + Multi-View Triangulation
+  • Frame-by-frame track overlay
+  • NEW: Last-3 Keyframes triptych (OpenCV window, reliable)
+      - New landmarks (just triangulated) = GREEN dots
+      - Cross-KF polyline turns RED once a landmark is seen in ≥ --track_maturity KFs
+      - Per-panel overlay: "KF #i | features: N"
+  • Optional 2-D Matplotlib trajectory plotter (stable refresh)
 
-Entry-point: high-level processing loop
---------------------------------------
-$ python main.py --dataset kitti --base_dir ../Dataset
-
-Adds:
-  • Triptych of last 3 keyframes with cross-KF feature tracks:
-      - New landmarks (just triangulated) are GREEN dots.
-      - A landmark's cross-KF polyline turns RED once it has been
-        observed in ≥ --track_maturity keyframes (default: 6).
-      - Per-panel overlay: "KF #i | features: N".
-  • Keeps your frame-by-frame track overlay via draw_tracks(...).
+Notes:
+  - Keyframe thumbnails in your Keyframe dataclass are lz4-compressed JPEG bytes.
+    We now decode those safely for visualization.  (see _decode_thumb)
 """
 
 import argparse
@@ -21,6 +20,8 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional, Iterable, Set
+
+import lz4.frame  # for decoding KF thumbnails
 
 from slam.core.pose_utils import _pose_inverse, _pose_rt_to_homogenous
 
@@ -41,7 +42,7 @@ from slam.core.features_utils import (
 from slam.core.keyframe_utils import (
     Keyframe,
     select_keyframe,
-    make_thumb,   # kept for your KF object (thumb stays compressed)
+    make_thumb,   # retained, but we keep our own BGR thumbs for GUI
 )
 
 from slam.core.visualization_utils import (
@@ -90,8 +91,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--kf_cooldown', type=int, default=5)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2, default=[640, 360])
 
-    # 3-D visualisation toggle
+    # visualization toggles
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3-D visualization window")
+    p.add_argument('--no_plot2d', action='store_true', help='Disable the Matplotlib 2-D trajectory plotter')
 
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.60)
@@ -120,7 +122,7 @@ def _build_parser() -> argparse.ArgumentParser:
 #  Bootstrap initialisation
 # --------------------------------------------------------------------------- #
 def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
-    """Return (success, T_cam1_w) and add initial landmarks."""
+    """Return (success, T1_wc) and add initial landmarks."""
     if len(matches) < 50:
         return False, None
 
@@ -142,7 +144,6 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
         mask = (inl_E.ravel() & inl_pose.ravel()).astype(bool)
     else:
         print("[BOOTSTRAP] Using Homography for initialisation")
-        # Choose first hypothesis – adequate for bootstrap
         R, t = cv2.decomposeHomographyMat(H, K)[1:3]
         mask = inl_H.ravel().astype(bool)
 
@@ -185,13 +186,10 @@ def try_bootstrap(K, kp0, descs0, kp1, descs1, matches, args, world_map):
 
 
 # --------------------------------------------------------------------------- #
-#  Continuous pose tracking (PnP) + reprojection debug
+#  PnP + reprojection debug
 # --------------------------------------------------------------------------- #
 def visualize_pnp_reprojection(img_bgr, K, T_wc, pts3d_w, pts2d_px, inlier_mask=None,
                                win_name="PnP debug", thickness=2):
-    """
-    Draw measured vs projected locations for PnP inliers.
-    """
     img = img_bgr.copy()
     T_cw = np.linalg.inv(T_wc)
     R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
@@ -200,11 +198,12 @@ def visualize_pnp_reprojection(img_bgr, K, T_wc, pts3d_w, pts2d_px, inlier_mask=
 
     proj, _ = cv2.projectPoints(pts3d_w.astype(np.float32), rvec, tvec, K, None)
     proj = proj.reshape(-1, 2)
+
     if inlier_mask is None:
         inlier_mask = np.ones(len(proj), dtype=bool)
 
     for (u_meas, v_meas), (u_proj, v_proj), ok in zip(pts2d_px, proj, inlier_mask):
-        color = (0, 255, 0) if ok else (0, 0, 255)
+        color = (0, 255, 0) if ok else (0, 0, 255)  # green inlier, red outlier
         cv2.circle(img, (int(round(u_proj)), int(round(v_proj))), 4, (255, 0, 0), -1)
         cv2.circle(img, (int(round(u_meas)), int(round(v_meas))), 4, color, -1)
         if ok:
@@ -212,6 +211,7 @@ def visualize_pnp_reprojection(img_bgr, K, T_wc, pts3d_w, pts2d_px, inlier_mask=
                      (int(round(u_meas)), int(round(v_meas))),
                      (int(round(u_proj)), int(round(v_proj))),
                      color, thickness)
+
     cv2.imshow(win_name, img)
     cv2.waitKey(1)
     return img
@@ -222,10 +222,6 @@ def track_with_pnp(K,
                    frame_no,
                    Twc_prev,
                    world_map, args):
-    """
-    Project map landmarks with Twc_prev, associate to current keypoints,
-    estimate Twc for the current frame (RANSAC+LM), and return inlier assoc.
-    """
     if len(world_map.points) < 4 or len(kp_cur) == 0:
         print(f"[PNP] Not enough data at frame {frame_no} "
               f"(points={len(world_map.points)}, kps={len(kp_cur)})")
@@ -269,7 +265,7 @@ def track_with_pnp(K,
         print(f"[PNP] Not enough 2D–3D correspondences (found {len(pts3d)}) at frame {frame_no}")
         return False, None, set()
 
-    R_cw, tvec = refine_pose_pnp(K, pts3d, pts2d)   # AP3P RANSAC + LM
+    R_cw, tvec = refine_pose_pnp(K, pts3d, pts2d)
     if R_cw is None:
         print(f"[PNP] RANSAC/LM failed at frame {frame_no}")
         return False, None, set()
@@ -299,15 +295,16 @@ def track_with_pnp(K,
 
 
 # --------------------------------------------------------------------------- #
-#  NEW — Keyframe track visualizations (self-contained helpers)
+#  NEW — Keyframe track visualizations
 # --------------------------------------------------------------------------- #
 def _ensure_bgr(img: np.ndarray) -> np.ndarray:
+    if img is None:
+        return None
     if img.ndim == 2:
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     if img.shape[2] == 4:
         return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     return img
-
 
 def _put_text_with_outline(img: np.ndarray, text: str, org: Tuple[int, int],
                            scale: float = 0.7, color=(255, 255, 255),
@@ -315,29 +312,35 @@ def _put_text_with_outline(img: np.ndarray, text: str, org: Tuple[int, int],
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
+def _decode_thumb(thumb_bytes: bytes) -> Optional[np.ndarray]:
+    """
+    Decode lz4-compressed JPEG bytes (Keyframe.thumb) into a BGR image.
+    """
+    if not isinstance(thumb_bytes, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        raw = lz4.frame.decompress(thumb_bytes)   # JPEG bytes
+        arr = np.frombuffer(raw, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return img
+    except Exception:
+        return None
 
 def _collect_obs_for_kf(world_map: Map, kf_idx: int) -> Dict[int, int]:
-    """
-    Return {pid -> kp_idx} for all points that have an observation in keyframe `kf_idx`.
-    """
+    """Return {pid -> kp_idx} for all points that have an observation in keyframe `kf_idx`."""
     out: Dict[int, int] = {}
     for pid, mp in world_map.points.items():
         for fidx, kpi, _ in mp.observations:
             if fidx == kf_idx:
                 out[pid] = kpi
                 break
-    return out
-
+    return out  # observations are stored as (frame_idx, kp_idx, descriptor). :contentReference[oaicite:2]{index=2}
 
 def _track_length_in_keyframes(world_map: Map, pid: int) -> int:
-    """
-    Count how many DISTINCT keyframes have seen this landmark.
-    """
     if pid not in world_map.points:
         return 0
     kf_set = {f for (f, _, _) in world_map.points[pid].observations}
     return len(kf_set)
-
 
 def render_kf_triptych(
     kf_triplet: List[Tuple[int, np.ndarray, List[cv2.KeyPoint]]],
@@ -350,31 +353,37 @@ def render_kf_triptych(
     """
     Render last-3 keyframes side-by-side, overlaying features and cross-KF tracks.
 
-    kf_triplet: [(kf_pose_idx, thumb_bgr, keypoints), ...]  (len = 1..3)
+    kf_triplet: [(kf_pose_idx, bgr_image, keypoints), ...]  len = 1..3
     """
     if not kf_triplet:
         return None
 
     new_ids_set: Set[int] = set(new_ids) if new_ids is not None else set()
 
-    # Normalise sizes (use first panel as reference)
+    # Normalise sizes (use first as reference)
     H0, W0 = kf_triplet[0][1].shape[:2]
     panels = []
     for kf_idx, img, _ in kf_triplet:
         img = _ensure_bgr(img)
+        if img is None:
+            continue
         if img.shape[:2] != (H0, W0):
             img = cv2.resize(img, (W0, H0), interpolation=cv2.INTER_AREA)
         panels.append((kf_idx, img.copy()))
+    if not panels:
+        return None
 
     # Precompute observations for each KF
     obs_by_kf: Dict[int, Dict[int, int]] = {kf: _collect_obs_for_kf(world_map, kf) for kf, _ in panels}
 
     # Draw points on each panel
     for (kf_idx, img), (_, _, kps) in zip(panels, kf_triplet):
-        obs = obs_by_kf[kf_idx]
+        obs = obs_by_kf.get(kf_idx, {})
         feat_count = len(obs)
-        _put_text_with_outline(img, f"KF #{kf_idx} | features: {feat_count}", (10, 24), 0.7, (255, 255, 255), 2)
+        _put_text_with_outline(img, f"KF #{kf_idx} | features: {feat_count}", (10, 24), 0.8, (255, 255, 255), 2)
         for pid, kp_idx in obs.items():
+            if kp_idx < 0 or kp_idx >= len(kps):  # defensive
+                continue
             x, y = map(int, np.round(kps[kp_idx].pt))
             color = (0, 255, 0) if pid in new_ids_set else (220, 220, 220)
             r = 4 if pid in new_ids_set else 3
@@ -395,9 +404,11 @@ def render_kf_triptych(
     # Draw cross-KF polylines for landmarks that appear in ≥2 of the panels
     track_map: Dict[int, List[Tuple[int, Tuple[int, int]]]] = {}
     for pidx, (kf_idx, _img) in enumerate(panels):
-        obs = obs_by_kf[kf_idx]
+        obs = obs_by_kf.get(kf_idx, {})
         kps = kf_triplet[pidx][2]
         for pid, kp_idx in obs.items():
+            if kp_idx < 0 or kp_idx >= len(kps):
+                continue
             pt = tuple(map(int, np.round(kps[kp_idx].pt)))
             track_map.setdefault(pid, []).append((pidx, pt))
 
@@ -409,7 +420,6 @@ def render_kf_triptych(
         for pidx, (x, y) in samples:
             pts.append([x + x_offsets[pidx], y])
         pts = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-
         L = _track_length_in_keyframes(world_map, pid)
         colour = (0, 0, 255) if L >= maturity_thresh else (0, 255, 0)
         cv2.polylines(canvas, [pts], isClosed=False, color=colour, thickness=2, lineType=cv2.LINE_AA)
@@ -435,13 +445,12 @@ def main():
 
     # ------ build 4×4 GT poses + alignment matrix (once) ----------------
     gt_T = None
-    R_align = t_align = None
     if groundtruth is not None:
         gt_T = np.pad(groundtruth, ((0, 0), (0, 1), (0, 0)), constant_values=0.0)
         gt_T[:, 3, 3] = 1.0
-        R_align, t_align = compute_gt_alignment(gt_T)
+        _ = compute_gt_alignment(gt_T)  # retained if you want aligned GT later
 
-    # --- feature pipeline (OpenCV / LightGlue) ---
+    # --- feature pipeline ---
     detector, matcher = init_feature_pipeline(args)
 
     mvt = MultiViewTriangulator(
@@ -462,20 +471,25 @@ def main():
     Twc_cur_pose = np.eye(4)
     world_map.add_pose(Twc_cur_pose, is_keyframe=True)
     viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
-    plot2d = TrajectoryPlotter()
+
+    plot2d = None if args.no_plot2d else TrajectoryPlotter()   # Matplotlib plotter window. :contentReference[oaicite:3]{index=3}
 
     kfs: list[Keyframe] = []
     last_kf_frame_no = -999
-
-    # For BA (kept as in your code)
     frame_keypoints: List[List[cv2.KeyPoint]] = []
-    frame_keypoints.append([])   # placeholder to keep indices aligned
+    frame_keypoints.append([])
 
     total = len(seq) - 1
 
-    # NEW: KF thumbnails & keypoints by *world_map pose index* of KF
-    kf_vis: Dict[int, Tuple[np.ndarray, List[cv2.KeyPoint]]] = {}  # {kf_idx: (thumb_bgr, kps)}
-    new_ids: List[int] = []  # store newly triangulated landmark IDs for visualization
+    # For triptych: map[kf_pose_idx] -> (thumb_bgr, kps)
+    kf_vis: Dict[int, Tuple[np.ndarray, List[cv2.KeyPoint]]] = {}
+
+    new_ids: List[int] = []  # new landmarks added at the most recent KF
+
+    # Prepare a named, resizable window for the triptych (stable)
+    TRIP_WIN = "Keyframes (last 3) — feature tracks"
+    if not args.no_triptych:
+        cv2.namedWindow(TRIP_WIN, cv2.WINDOW_NORMAL)
 
     for i in tqdm(range(total), desc='Tracking'):
         img1, img2 = load_frame_pair(args, seq, i)
@@ -490,7 +504,7 @@ def main():
             print(f"[WARN] Not enough matches at frame {i}. Skipping.")
             continue
 
-        # ---------------- Frame-by-frame track overlay (GUI) ----------------
+        # ---------------- Frame-by-frame track overlay ----------------
         frame_no = i + 1
         curr_map, tracks, next_track_id = update_and_prune_tracks(
             matches, prev_map, tracks, kp2, frame_no, next_track_id)
@@ -508,7 +522,6 @@ def main():
                                 pose=Twc_cur_pose,
                                 thumb=make_thumb(img1, tuple(args.kf_thumb_hw))))
             last_kf_frame_no = kfs[-1].frame_idx
-            prev_len = len(kfs)
             is_kf = False
             continue
         else:
@@ -550,7 +563,7 @@ def main():
             args=args
         )
 
-        # Fallback to 2-D-2-D only if PnP failed (fixed)
+        # Fallback to 2-D-2-D only if PnP failed
         if not ok_pnp:
             print(f"[WARN] PnP failed at frame {i}. Using 2D-2D tracking.")
             last_kf = kfs[-1] if not is_kf else (kfs[-2] if len(kfs) > 1 else kfs[0])
@@ -582,11 +595,12 @@ def main():
         if is_kf:
             kf_pose_idx = len(world_map.poses) - 1
 
-            # Store a BGR thumbnail (avoid bytes decoding issues for GUI)
-            w, h = tuple(args.kf_thumb_hw)
+            # Build a BGR thumbnail for GUI (avoid bytes-in-GUI issues)
+            w, h = tuple(args.kf_thumb_hw)  # [W, H] by convention in your code. :contentReference[oaicite:4]{index=4}
             thumb_bgr = cv2.resize(img2, (w, h), interpolation=cv2.INTER_AREA)
             kf_vis[kf_pose_idx] = (thumb_bgr, kp2)
 
+            # (Still store compressed thumb in Keyframe via select_keyframe)
             mvt.add_keyframe(
                 frame_idx=kf_pose_idx,
                 Twc_pose=Twc_cur_pose,
@@ -602,22 +616,31 @@ def main():
         if is_kf and (len(kfs) % args.local_ba_window == 0):
             center_kf_idx = len(world_map.poses) - 1
             print(f"[BA] Running local BA around key-frame {center_kf_idx} (window size = {args.local_ba_window})")
-            world_map_before = deepcopy(world_map)
+            _ = deepcopy(world_map)
             local_bundle_adjustment(
                 world_map, K, frame_keypoints,
                 center_kf_idx=center_kf_idx,
                 window_size=args.local_ba_window)
 
-        # ---------------- Cheap 2D path plot -------------------
+        # ---------------- 2D path plot (Matplotlib) -------------------
         def _scale_translation(pos3: np.ndarray, scale: float) -> np.ndarray:
+            """
+            Scale a 3D *position* (translation) by 'scale' for plotting.
+            NOTE: Do NOT multiply the whole 4x4 pose by a scalar—only scale the translation component.
+            """
             return np.asarray(pos3, dtype=float) * float(scale)
-
-        est_pos = Twc_cur_pose[:3, 3]
-        gt_pos  = None
-        if gt_T is not None and i + 1 < len(gt_T):
-            p_gt = gt_T[i + 1, :3, 3]
-            gt_pos = _scale_translation(p_gt, 0.3)
-        plot2d.append(est_pos, gt_pos, mirror_x=False)
+        
+        if plot2d is not None:
+            est_pos = Twc_cur_pose[:3, 3]
+            gt_pos  = None
+            if gt_T is not None and i + 1 < len(gt_T):
+                p_gt = gt_T[i + 1, :3, 3]                     # raw GT
+                # gt_pos = apply_alignment(p_gt, R_align, t_align)
+                gt_pos = _scale_translation(p_gt, 0.3)
+            plot2d.append(est_pos, gt_pos, mirror_x=False)
+            # tiny event loop tick for reliable redraw across backends
+            import matplotlib.pyplot as _plt
+            _plt.pause(0.001)  # <-- prevents the “small black rectangle” issue in many setups. :contentReference[oaicite:5]{index=5}
 
         # ---------------- 3D viz (Open3D) ----------------------
         if viz3d is not None:
@@ -629,22 +652,35 @@ def main():
             triplet = []
             for idx in last_kf_indices:
                 thumb, kps = kf_vis[idx]
+                # defensive: if thumb somehow missing, try decoding stored Keyframe.thumb
+                if thumb is None or thumb.size == 0:
+                    # find KF order to map idx→Keyframe
+                    # (poses are appended in order, so i-th KF has pose index world_map.keyframe_indices[i])
+                    # but we cached thumbs; this is a fallback for robustness
+                    for kf in kfs:
+                        if kf.pose is not None and idx < len(world_map.poses):
+                            dec = _decode_thumb(kf.thumb)  # lz4-compressed JPEG → BGR. :contentReference[oaicite:6]{index=6}
+                            if dec is not None:
+                                w, h = tuple(args.kf_thumb_hw)
+                                thumb = cv2.resize(dec, (w, h), interpolation=cv2.INTER_AREA)
+                                break
                 triplet.append((idx, thumb, kps))
             trip = render_kf_triptych(
                 triplet, world_map,
                 maturity_thresh=args.track_maturity,
                 new_ids=new_ids,
-                title=f"New points: green • Mature tracks (≥{args.track_maturity}) : red"
+                title=f"New points: green || Mature tracks (>= {args.track_maturity}) : red"
             )
             if trip is not None:
-                cv2.imshow("Keyframes (last 3) — feature tracks", trip)
+                # ensure the window is large enough to see everything
+                H, W = trip.shape[:2]
+                cv2.resizeWindow(TRIP_WIN, max(960, int(W)), max(360, int(H)))
+                cv2.imshow(TRIP_WIN, trip)
 
         # ---------------- UI keys ------------------------------
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(0) & 0xFF
         if key == 27:  # ESC
             break
-        if key == ord('p') and viz3d is not None:
-            viz3d.paused = not viz3d.paused
 
     cv2.destroyAllWindows()
 

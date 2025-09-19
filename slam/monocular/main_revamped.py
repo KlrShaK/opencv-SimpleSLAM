@@ -54,7 +54,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcN
 # logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
 # logging.getLogger("pnp").setLevel(logging.DEBUG)
 # logging.getLogger("multi_view").setLevel(logging.DEBUG)
-logging.getLogger("triangulation").setLevel(logging.DEBUG)
+# logging.getLogger("triangulation").setLevel(logging.DEBUG)
 log = logging.getLogger("main")
 
 
@@ -141,7 +141,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.40)
-    p.add_argument("--max_depth", type=float, default=100.0)
+    p.add_argument("--max_depth", type=float, default=float('inf'))
     p.add_argument('--mvt_rep_err', type=float, default=2.0,
                help='Max mean reprojection error (px) for multi-view triangulation')
 
@@ -151,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--merge_radius',    type=float, default=0.10)
 
     # Bundle Adjustment
-    p.add_argument('--local_ba_window', type=int, default=6, help='Window size (number of keyframes) for local BA')
+    p.add_argument('--local_ba_window', type=int, default=10, help='Window size (number of keyframes) for local BA')
 
     return p
 
@@ -323,6 +323,11 @@ def main():
             # SET INITIALISED FLAG
             initialised = True
             print("-----BOOTSTRAPPED SUCCESSFULLY-----")
+            
+            if viz3d:
+                # highlight everything once (all points are new at bootstrap)
+                viz3d.update(world_map, new_ids=world_map.point_ids())
+
             Tcw_cur_pose = T1_cw.copy()   # current camera pose (optional)
             bs.clear()
             continue
@@ -432,18 +437,22 @@ def main():
                 except Exception as e:
                     log.warning(f"[BA] Local BA failed: {e}")
 
+                if viz3d:
+                    viz3d.update(world_map, new_ids=new_ids)
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
 
         # --------------------------------------MISCELLANEOUS INFO ---------------------------------------------------
-        print(f"[traj2d] est={len(traj2d.est_xyz)} gt={len(traj2d.gt_xyz)}")
-        print(f"Frame {i+1}/{total}  |  FPS: {achieved_fps:.1f}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
+        # print(f"[traj2d] est={len(traj2d.est_xyz)} gt={len(traj2d.gt_xyz)}")
+        # print(f"Frame {i+1}/{total}  |  FPS: {achieved_fps:.1f}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
         
         # ------------------------------------------------------------------- #
         # --------------------- Visualization ----------------------- #
         # ------------------------------------------------------------------- #
+        if viz3d:
+            viz3d.update(world_map, new_ids=new_ids)
         # --- draw & UI control (end of iteration) ---
         traj2d.draw(paused=ui.paused)
 
@@ -457,7 +466,9 @@ def main():
             # if user pressed 'n', did_step=True -> allow this iteration to exit;
             # next iteration will immediately pause again (nice for stepping).
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
-        
+    
+    if viz3d:
+        viz3d.close()    
 
 if __name__ == '__main__':
     main()
