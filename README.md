@@ -1,34 +1,11 @@
-# Structure From Motion (SfM) - README
-
+# Implementing a SLAM framework from scratch - README
 
 https://github.com/user-attachments/assets/f489a554-299e-41ad-a4b4-436e32d8cbd5
 
+## Preface
+This project was was done for **OpenCV** under the guidance of *Gary Bradski* and *Reza Amayeh* supported by **Google Summer of Code(GSOC) 2025**. This project presents a methodological approach to designing, implementing, and documenting a **Simultaneous Localization and Mapping(SLAM) framework from scratch in Python**. The primary objective is to build a fully functional, OpenCV-based SLAM system with clear documentation to facilitate reproducibility, future extensions, and adoption by the broader computer vision community. Traditional SLAM systems that rely on hand-crafted features (e.g., ORB, SIFT) often exhibit reduced robustness under challenging conditions such as viewpoint shifts, illumination changes, or motion blur. To address these limitations, we integrate modern learned features—ALIKED keypoints and descriptors *(Zhao et al., 2022)* combined with the LightGlue matcher *(Lindenberger et al., 2023)*—into a streamlined SLAM pipeline. This integration improves tracking stability and relocalization performance, especially in environments with significant photometric and geometric variations.
 
-## IMPORTANT - LightGlue Installation- 
-- 1st do this
-```
-git clone https://github.com/cvg/LightGlue.git && cd LightGlue
-python -m pip install -e .
-```
-- 2nd download data
-  - https://rpg.ifi.uzh.ch/docs/teaching/2024/kitti05.zip
-
-  - put it in folder named 'Dataset'
-
-- 3rd
-  - intall ```requirements.txt```
-  - ```bash scripts/run_tracker_visualization.sh```
-
-## INSTALLING COLMAP
-![Image showing commands](media/colmap_instruc.png)
-use this command - ```ninja -j4 -l 8 > build.log 2>&1```
-
-
-for pycolmap - https://colmap.github.io/pycolmap/index.html#pycolmap-index
-
-refer the image if when running the command it freezes and crashes
-![pycolmap instructions- Image showing commands](media/pycolmap_instruc.png)
-
+In addition, the system **extends feature extraction and matching using [LightGlue](https://github.com/cvg/LightGlue)** *(Lindenberger et al., 2023)* and leverages **[PyCeres](https://github.com/cvg/pyceres)** for non-linear optimization, enabling efficient **bundle adjustment and graph optimization** within the pipeline.
 
 ## Overview
 
