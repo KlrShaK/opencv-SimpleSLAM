@@ -37,6 +37,8 @@ else:
 
 from slam.core.landmark_utils import Map
 import numpy as np
+import matplotlib.pyplot as plt
+
 
 ColourAxis = Literal["x", "y", "z", "auto"]
 
@@ -274,26 +276,68 @@ def draw_tracks(
 
 # ---- Trajectory 2D (x–z) + simple pause UI ----
 class Trajectory2D:
+    """
+    Matplotlib-based 2D trajectory plotter (x–z), with GT↔EST Sim(3) alignment
+    and a live display of the *scale* (s) used for alignment.
+
+    Public API mirrors the original Trajectory2D:
+        - __init__(gt_T_list=None, win="Trajectory 2D (x–z)")
+        - push(frame_idx: int, Tcw: np.ndarray)
+        - draw(paused: bool=False)
+    """
     def __init__(self, gt_T_list=None, win="Trajectory 2D (x–z)"):
+        # state
         self.win = win
-        self.gt_T = gt_T_list  # list of 4x4 Twc (or None)
-        self.est_xyz = []      # estimated camera centers (world)
-        self.gt_xyz  = []      # paired GT centers
+        self.gt_T = gt_T_list   # list of 4x4 Twc (or None)
+        self.est_xyz: list[np.ndarray] = []   # estimated camera centers (world)
+        self.gt_xyz:  list[np.ndarray] = []   # paired GT centers
         self.align_ok = False
-        self.s = 1.0
+        self.s = 1.45 # initial guess
         self.R = np.eye(3)
         self.t = np.zeros(3)
 
-        # ensure a real window exists (Qt backend is happier with this)
-        cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.win, 500, 500)
+        # small OpenCV 'ghost' window so cv2.waitKey in VizUI keeps working
+        # (keep it tiny and unobtrusive)
+        try:
+            cv2.namedWindow("__ghost__", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("__ghost__", 1, 1)
+            cv2.imshow("__ghost__", np.zeros((1, 1, 3), np.uint8))
+        except Exception:
+            pass
+
+        # Matplotlib figure
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(6, 6))
+        try:
+            # not all backends expose this
+            self.fig.canvas.manager.set_window_title(win)
+        except Exception:
+            pass
+
+        self.ax.set_xlabel("x")
+        self.ax.set_ylabel("z")
+        self.ax.grid(True, which="both", alpha=0.3)
+        self.ax.set_aspect("equal", adjustable="box")
+
+        # line objects for fast updates
+        (self.line_est,) = self.ax.plot([], [], lw=2, label="estimate")
+        (self.line_gt,)  = self.ax.plot([], [], lw=2, label="ground-truth")
+
+        # text overlay for alignment scale + status
+        self.info_text = self.ax.text(
+            0.02, 0.98, "", transform=self.ax.transAxes,
+            va="top", ha="left", fontsize=10, bbox=dict(boxstyle="round,pad=0.3", fc="w", ec="0.8", alpha=0.8)
+        )
+
+        self.legend = None
 
     @staticmethod
     def _cam_center_from_Tcw(Tcw: np.ndarray) -> np.ndarray:
         R, t = Tcw[:3, :3], Tcw[:3, 3]
         return (-R.T @ t).astype(np.float64)
 
-    def _maybe_update_alignment(self, Kpairs=60):
+    def _maybe_update_alignment(self, Kpairs: int = 100):
+        # Need at least a few pairs
         if len(self.est_xyz) < 6 or len(self.gt_xyz) < 6:
             return
         X = np.asarray(self.gt_xyz[-Kpairs:], np.float64)   # GT
@@ -314,108 +358,78 @@ class Trajectory2D:
         self.est_xyz.append(self._cam_center_from_Tcw(Tcw))
         if self.gt_T is not None and 0 <= frame_idx < len(self.gt_T):
             self.gt_xyz.append(self.gt_T[frame_idx][:3, 3].astype(np.float64))
-        self._maybe_update_alignment(Kpairs=min(100, len(self.est_xyz)))
+        # self._maybe_update_alignment(Kpairs=min(100, len(self.est_xyz))) # TODO: TEMPORARY - UNCOMMENT WHEN YOU WANT ALIGNMENT
 
-    def draw(self, paused=False, size=(720, 720), margin=60):
-        W, H = size
-        canvas = np.full((H, W, 3), 255, np.uint8)
-
+    def draw(self, paused: bool = False, margin_frac: float = 0.05):
         # nothing to draw yet
         if not self.est_xyz:
-            cv2.imshow(self.win, canvas)
+            self.fig.canvas.draw_idle(); self.fig.canvas.flush_events()
             return
-
+        
+        self.align_ok = True # TODO: TEMPORARY - REMOVE WHEN YOU WANT ALIGNMENT
+        # Assemble current series
         E = np.asarray(self.est_xyz, np.float64)
         if self.align_ok:
             E = (self.s * (self.R @ E.T)).T + self.t
 
-        curves = [("estimate", E, (255, 0, 0))]  # BGR: blue
         have_gt = len(self.gt_xyz) > 0
         if have_gt:
             G = np.asarray(self.gt_xyz, np.float64)
-            curves.append(("ground-truth", G, (0, 0, 255)))    # red
-            allpts = np.vstack([E[:, [0, 2]], G[:, [0, 2]]])
+            # axis limits based on both
+            all_x = np.concatenate([E[:, 0], G[:, 0]])
+            all_z = np.concatenate([E[:, 2], G[:, 2]])
         else:
-            allpts = E[:, [0, 2]]
+            all_x = E[:, 0]; all_z = E[:, 2]
 
-        # ----- nice bounds with padding -----
-        minx, minz = allpts.min(axis=0); maxx, maxz = allpts.max(axis=0)
-        pad_x = 0.05 * max(1e-6, maxx - minx)
-        pad_z = 0.05 * max(1e-6, maxz - minz)
-        minx -= pad_x; maxx += pad_x
-        minz -= pad_z; maxz += pad_z
-
+        # Pad bounds a little
+        minx, maxx = all_x.min(), all_x.max()
+        minz, maxz = all_z.min(), all_z.max()
         spanx = max(maxx - minx, 1e-6)
         spanz = max(maxz - minz, 1e-6)
-        sx = (W - 2 * margin) / spanx
-        sz = (H - 2 * margin) / spanz
-        s = min(sx, sz)
+        pad_x = margin_frac * spanx
+        pad_z = margin_frac * spanz
 
-        def to_px(x, z):
-            u = int((x - minx) * s + margin)
-            v = int((maxz - z) * s + margin)  # flip z for image y
-            return u, v
+        self.ax.set_xlim(minx - pad_x - 50, maxx + pad_x + 50)  # extra horiz. space for legend
+        self.ax.set_ylim(minz - pad_z - 30, maxz + pad_z + 30)
 
-        # ----- grid + ticks (matplotlib-ish) -----
-        def linspace_ticks(a, b, m=6):
-            # simple ticks; good enough for live viz
-            return np.linspace(a, b, m)
+        # Update lines: plot x vs z
+        self.line_est.set_data(E[:, 0], E[:, 2])
+        if have_gt:
+            self.line_gt.set_data(G[:, 0], G[:, 2])
+            self.line_gt.set_visible(True)
+        else:
+            self.line_gt.set_visible(False)
 
-        ticks_x = linspace_ticks(minx, maxx, 6)
-        ticks_z = linspace_ticks(minz, maxz, 6)
+        # Keep equal aspect for geometric fidelity
+        self.ax.set_aspect("equal", adjustable="box")
 
-        # draw background grid
-        for x in ticks_x:
-            u0, v0 = to_px(x, minz)
-            u1, v1 = to_px(x, maxz)
-            cv2.line(canvas, (u0, v0), (u1, v1), (235, 235, 235), 1, cv2.LINE_AA)
-        for z in ticks_z:
-            u0, v0 = to_px(minx, z)
-            u1, v1 = to_px(maxx, z)
-            cv2.line(canvas, (u0, v0), (u1, v1), (235, 235, 235), 1, cv2.LINE_AA)
-
-        # axis box
-        cv2.rectangle(canvas, (margin-1, margin-1), (W-margin, H-margin), (200, 200, 200), 1)
-
-        # tick labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        for x in ticks_x:
-            u, v = to_px(x, minz)
-            cv2.putText(canvas, f"{x:.1f}", (u-14, H - margin + 20), font, 0.4, (0,0,0), 1, cv2.LINE_AA)
-        for z in ticks_z:
-            u, v = to_px(minx, z)
-            cv2.putText(canvas, f"{z:.1f}", (margin - 50, v+4), font, 0.4, (0,0,0), 1, cv2.LINE_AA)
-
-        # axis labels
-        cv2.putText(canvas, "x", (W//2, H - 10), font, 0.6, (0,0,0), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "z", (10, H//2), font, 0.6, (0,0,0), 1, cv2.LINE_AA)
-
-        # ----- draw curves -----
-        for name, C, color in curves:
-            if C.shape[0] < 2:
-                # single point
-                u, v = to_px(C[-1, 0], C[-1, 2])
-                cv2.circle(canvas, (u, v), 3, color, -1, cv2.LINE_AA)
-            else:
-                pts = [to_px(x, z) for (x, _, z) in C]
-                for p, q in zip(pts[:-1], pts[1:]):
-                    cv2.line(canvas, p, q, color, 2, cv2.LINE_AA)
-                cv2.circle(canvas, pts[-1], 3, color, -1, cv2.LINE_AA)
-
-        # legend
-        legend_x, legend_y = margin + 10, margin + 20
-        for idx, (name, _, color) in enumerate(curves):
-            y = legend_y + idx * 20
-            cv2.line(canvas, (legend_x, y), (legend_x + 30, y), color, 3, cv2.LINE_AA)
-            cv2.putText(canvas, name, (legend_x + 40, y + 4), font, 0.5, (60,60,60), 1, cv2.LINE_AA)
-
-        # title and paused hint
-        cv2.putText(canvas, "Trajectory 2D (x–z)", (margin, 30), font, 0.7, (0,0,0), 2, cv2.LINE_AA)
+        # Info box (scale + status)
+        if have_gt and self.align_ok:
+            info = f"s = {self.s:.4f}  •  R={self.R.shape[0]}x{self.R.shape[1]}  •  aligned ✓"
+        elif have_gt:
+            info = "s = 1.0000  •  aligning…"
+        else:
+            info = "No GT available • showing EST only"
         if paused:
-            cv2.putText(canvas, "PAUSED  [p: resume | n: step | q/Esc: quit]",
-                        (margin, H - 15), font, 0.5, (20,20,20), 2, cv2.LINE_AA)
+            info += "\nPAUSED  [p: resume | n: step | q/Esc: quit]"
+        self.info_text.set_text(info)
 
-        cv2.imshow(self.win, canvas)
+        # Legend once
+        if self.legend is None:
+            handles = [self.line_est] + ([self.line_gt] if have_gt else [])
+            labels  = ["estimate"] + (["ground-truth"] if have_gt else [])
+            self.legend = self.ax.legend(handles, labels, loc="upper right", framealpha=0.85)
+
+        # Draw
+        self.fig.canvas.draw_idle()
+        try:
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
+    # Optional getter if you want to read the current scale from outside
+    def current_scale(self) -> float:
+        return float(self.s)
 
 
 # --------------------------------------------------------------------------- #
