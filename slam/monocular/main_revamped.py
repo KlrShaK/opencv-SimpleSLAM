@@ -49,15 +49,6 @@ from slam.core.visualization_utils import draw_tracks, Visualizer3D, Trajectory2
 from slam.core.trajectory_utils import compute_gt_alignment, apply_alignment
 from slam.core.landmark_utils import Map
 
-import logging
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s") # INFO for clean summary, DEBUG for deep dive
-# logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
-# logging.getLogger("pnp").setLevel(logging.DEBUG)
-# logging.getLogger("multi_view").setLevel(logging.DEBUG)
-# logging.getLogger("triangulation").setLevel(logging.DEBUG)
-log = logging.getLogger("main")
-
-
 from slam.core.two_view_bootstrap import (
     InitParams,
     pts_from_matches,                        # used to build point arrays
@@ -76,7 +67,16 @@ from slam.core.triangulation_utils import (
     triangulate_between_kfs_2view
 )
 
-from slam.core.ba_utils import pose_only_ba, local_bundle_adjustment
+from slam.core.ba_utils import pose_only_ba, local_bundle_adjustment, global_bundle_adjustment
+
+import logging
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s") # INFO for clean summary, DEBUG for deep dive
+# logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
+# logging.getLogger("pnp").setLevel(logging.DEBUG)
+# logging.getLogger("multi_view").setLevel(logging.DEBUG)
+# logging.getLogger("triangulation").setLevel(logging.DEBUG)
+log = logging.getLogger("main").setLevel(logging.DEBUG)
+
 
 
 class BootstrapState:
@@ -140,18 +140,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D visualization window")
 
     # triangulation depth filtering
-    p.add_argument("--min_depth", type=float, default=0.40)
+    p.add_argument("--min_depth", type=float, default=0.40) # 0.40
     p.add_argument("--max_depth", type=float, default=float('inf'))
     p.add_argument('--mvt_rep_err', type=float, default=2.0,
                help='Max mean reprojection error (px) for multi-view triangulation')
 
     #  PnP / map-maintenance
-    p.add_argument('--pnp_min_inliers', type=int, default=20)
-    p.add_argument('--proj_radius',     type=float, default=12.0)
+    p.add_argument('--pnp_min_inliers', type=int, default=15)
+    p.add_argument('--proj_radius',     type=float, default=10.0) # 12
     p.add_argument('--merge_radius',    type=float, default=0.10)
 
     # Bundle Adjustment
     p.add_argument('--local_ba_window', type=int, default=10, help='Window size (number of keyframes) for local BA')
+
+    # Global BA
+    p.add_argument('--gba_every', type=int, default=100, help='Run global BA every N frames')
+    p.add_argument('--gba_max_points', type=int, default=30000, help='Cap points in GBA (None = all)')
+    p.add_argument('--gba_max_iters', type=int, default=30, help='Ceres iterations for GBA')
+    p.add_argument('--gba_fix_first', type=int, default=1, help='1=fix first KF to anchor gauge, 0=free')
 
     return p
 
@@ -278,7 +284,7 @@ def main():
 
             # --- 2D Trajectory visualization bookkeeping ---
             traj2d.push(bs.frame_id_ref, T0_cw)
-            traj2d.push(i + 1,          T1_cw)
+            traj2d.push(i + 1, T1_cw)
             
             # --- Create the two initial Keyframes to mirror world_map KFs ---
             try:
@@ -365,6 +371,8 @@ def main():
                     iters=300, conf=0.999
                 )
                 ninl = int(inl_mask.sum()) if inl_mask.size else 0
+
+                # NOTE Could be converted to a function - because it is used again below in the tracking-lost case
                 if Tcw_est is not None and ninl >= int(args.pnp_min_inliers):
                     Tcw_cur_pose = Tcw_est
                     world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
@@ -372,7 +380,7 @@ def main():
                     # --- 2D Trajectory visualization bookkeeping ---
                     traj2d.push(i + 1, Tcw_cur_pose)
 
-                    log.info(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
+                    log.debug(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
 
                     # Optional: quick visual sanity overlay (comment out if headless)
                     try:
@@ -391,6 +399,41 @@ def main():
                 tracking_lost = True
 
             # (Optional) if tracking_lost: trigger relocalization here in the future.
+            if tracking_lost:                      # fallback to 2-D-2-D if PnP failed
+                log.info(f"[Track] PnP failed, fallback to 2D-2D tracking.")
+
+                # 1) Frame-to-frame matching (prev frame -> current)
+                tracking_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
+                # (Optionally) light geometric filtering first
+                tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, args.ransac_thresh)
+
+                pts0 = np.float32([kp1[m.queryIdx].pt for m in tracking_matches])
+                pts1 = np.float32([kp2[m.trainIdx].pt  for m in tracking_matches])
+
+                E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, args.ransac_thresh)
+                if E is not None and inlE is not None and int(inlE.sum()) >= 5:
+                    _, R, t, inlPose = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
+                    inl = inlPose.ravel().astype(bool)
+                log.debug(f"[Track] Fallback 2D-2D matches: raw={len(tracking_matches)}  inlE={int(inlE.sum()) if inlE is not None else 0}, inl={int(inl.sum()) if E is not None else 0}")
+                
+                _, R, t, mpose = cv2.recoverPose(E, pts0, pts1, K)
+                T_rel = _pose_rt_to_homogenous(R, t)   # c₁ → c₂
+                
+                # 2) Update current pose by relative motion into the world frame -------0---->>
+                Tcw_cur_pose = T_rel @ world_map.poses[-1]  # Tcw1 . Tc2c1 → T_cw2
+                world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+                # --- 2D Trajectory visualization bookkeeping ---
+                traj2d.push(i + 1, Tcw_cur_pose)
+                log.debug(f"[Track] Pushed fallback pose, inliers={int(inl.sum()) if E is not None else 0}")
+
+                tracking_lost = False
+
+            # TODO Recheck if placement is correct, NOTE usually pose only BA should happen on every tracking frame 
+            # --- BA pass 1: fast pose-only BA on current KF (uses its own obs) ---
+            try:
+                pose_only_ba(world_map, K, kfs, kf_idx=(len(kfs) - 1), max_iters=8, huber_thr=2.0)
+            except Exception as e:
+                log.warning(f"[BA] Pose-only BA failed: {e}")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
         
         
@@ -417,13 +460,6 @@ def main():
             )
             if new_ids:
                 log.info("[Map] Triangulated %d new points after KF %d.", len(new_ids), curr_kf.idx)
-
-                # TODO pose only BA should happen on every tracking frame and not here, but well, if it works we don't touch it
-                # --- BA pass 1: fast pose-only BA on current KF (uses its own obs) ---
-                try:
-                    pose_only_ba(world_map, K, kfs, kf_idx=curr_kf.idx, max_iters=8, huber_thr=2.0)
-                except Exception as e:
-                    log.warning(f"[BA] Pose-only BA failed: {e}")
 
                 # --- BA pass 2: local BA on a small KF window ---
                 try:
