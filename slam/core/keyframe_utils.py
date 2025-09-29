@@ -61,8 +61,13 @@ def is_new_keyframe(
     """
     # ---- 1) age gate ----
     age = frame_no - last_kf_frame_no
-    if age < kf_cooldown:
-        return False
+
+    # Optimistic cooldown - assumes that we would get a enough motion after a while 
+    # if age < kf_cooldown:
+    #     return False
+    # Pessimistic cooldown - assumes that we would not get a enough motion after a while, triangulates often
+    if age > kf_cooldown:
+        return True
 
     # ---- 2) compute signals ----
     n_inl = len(matches_to_kf)

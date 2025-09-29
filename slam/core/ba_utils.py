@@ -23,6 +23,10 @@ from pycolmap import cost_functions, CameraModelId
 import math
 from scipy.spatial.transform import Rotation as R
 
+import logging
+logger = logging.getLogger("ba")
+
+
 # TODO: USES T_cw (camera-from-world) convention for storing poses in the map, because of PyCERES, REMEMBER TO CONVERT, use below functions
 from slam.core.pose_utils import _pose_inverse, _pose_to_quat_trans, _quat_trans_to_pose
 
@@ -120,7 +124,7 @@ def pose_only_ba(world_map, K, kfs,
             added += 1
 
     if added < 10:
-        print("POSE-ONLY BA skipped – not enough residuals")
+        logger.warning("[Pose-only BA] skipped – not enough residuals")
         return
 
     opts = pyceres.SolverOptions()
@@ -133,7 +137,8 @@ def pose_only_ba(world_map, K, kfs,
     kfs[kf_idx].pose = new_Tcw
     if len(world_map.poses) > kf_idx:
         world_map.poses[kf_idx][:] = new_Tcw
-    print(f"[Pose-only BA] iters={getattr(summary,'num_successful_steps',0)}  residuals={added}")
+    logger.debug("[Pose-only BA] iters=%s residuals=%d", getattr(summary, "num_successful_steps", 0), added)
+
 
 # --------------------------------------------------------------------- #
 #  3) Local BA  (sliding window)
@@ -150,7 +155,7 @@ def local_bundle_adjustment(world_map, K, kfs,
     first_opt = max(1, center_kf_idx - window_size + 1)
     opt_kf    = list(range(first_opt, center_kf_idx + 1))
     fix_kf    = list(range(0, first_opt))
-    print(f"opt_kf={opt_kf}, fix_kf={fix_kf}, center_kf_idx={center_kf_idx}")
+    logger.debug("[Local BA window] | opt_kf=%s fix_kf=%s center=%d", opt_kf, fix_kf, center_kf_idx)
 
     _core_ba(world_map, K, kfs,
              opt_kf_idx = opt_kf,
@@ -160,21 +165,54 @@ def local_bundle_adjustment(world_map, K, kfs,
              info_tag   = f"[Local BA @ KF {center_kf_idx}]")
 
 # --------------------------------------------------------------------- #
-#  4) Global BA  (blue-print only)
+#  4) Global BA  (all keyframes + points)
 # --------------------------------------------------------------------- #
-def global_bundle_adjustment_blueprint(world_map, K, keypoints):
+def global_bundle_adjustment(
+    world_map, K, kfs,
+    *,
+    fix_first: bool = True,
+    max_points: int | None = 30000,
+    max_iters: int = 30
+):
     """
-    *** NOT WIRED YET ***
+    Run a full bundle adjustment over *all* keyframes and all landmarks
+    observed by them. By default we fix the very first keyframe to anchor
+    the gauge (otherwise the solution drifts by a similarity).
 
-    Outline:
-      • opt_kf_idx = all key-frames
-      • fix_kf_idx = []  (maybe fix the very first to anchor gauge)
-      • run _core_ba(...) with a robust kernel
-      • run asynchronously (thread) and allow early termination
-        if tracking thread needs the map
+    Parameters
+    ----------
+    world_map : Map
+        Your map container (points + poses). Poses are **T_cw**.
+    K : (3,3) ndarray
+        Intrinsic matrix of the (pinhole) camera.
+    kfs : list[Keyframe]
+        The keyframe list. Each KF stores pose in **T_cw**.
+    fix_first : bool
+        If True, fix KF-0 pose to anchor gauge freedom.
+    max_points : int | None
+        Optional cap on the number of 3-D points optimised (for speed).
+    max_iters : int
+        Ceres iterations.
+
+    Returns
+    -------
+    None  (poses and points are updated in-place)
     """
-    raise NotImplementedError
+    if len(kfs) < 2:
+        logger.warning("[Global BA] skipped – need at least 2 keyframes")
+        return
 
+    opt_kf_idx = list(range(len(kfs)))
+    fix_kf_idx = [0] if (fix_first and len(kfs) > 0) else []
+
+    _core_ba(
+        world_map, K, kfs,
+        opt_kf_idx=opt_kf_idx,
+        fix_kf_idx=fix_kf_idx,
+        max_points=max_points,
+        max_iters=max_iters,
+        info_tag=f"[Global BA] | KFs={len(kfs)} pts≤{max_points}]"
+    )
 
 # --------------------------------------------------------------------- #
 #  Shared low-level BA engine
@@ -244,12 +282,13 @@ def _core_ba(world_map, K, kfs,
             added_res += 1
 
     if added_res < 10:
-        print(f"{info_tag} skipped – not enough residuals")
+        logger.warning("%s skipped – not enough residuals", info_tag)
         return
 
     opts = pyceres.SolverOptions()
     opts.max_num_iterations = max_iters
-    opts.minimizer_progress_to_stdout = True
+    # opts.minimizer_progress_to_stdout = True # make true to debug
+    opts.minimizer_progress_to_stdout = False
     summary = pyceres.SolverSummary()
     pyceres.solve(opts, problem, summary)
 
@@ -263,4 +302,5 @@ def _core_ba(world_map, K, kfs,
     iters = getattr(summary, "iterations_used",
              getattr(summary, "num_successful_steps",
              getattr(summary, "num_iterations", None)))
-    print(f"{info_tag} iters={iters}  χ²={summary.final_cost:.2f}  residuals={added_res}")
+    logger.info("%s iters=%s  chi2=%.2f  residuals=%d",
+                info_tag, str(iters), float(getattr(summary, "final_cost", float("nan"))), added_res)

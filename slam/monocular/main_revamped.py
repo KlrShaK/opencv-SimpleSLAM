@@ -25,6 +25,17 @@ import lz4.frame
 import numpy as np
 from tqdm import tqdm
 from typing import List
+import logging
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s") # INFO for clean summary, DEBUG for deep dive
+# logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
+# logging.getLogger("pnp").setLevel(logging.DEBUG)
+# logging.getLogger("multi_view").setLevel(logging.DEBUG)
+# logging.getLogger("triangulation").setLevel(logging.DEBUG)
+# logging.getLogger("ba").setLevel(logging.DEBUG)
+log = logging.getLogger("main")
+log.setLevel(logging.DEBUG)
+
 
 from slam.core.pose_utils import _pose_inverse, _pose_rt_to_homogenous
 
@@ -69,14 +80,6 @@ from slam.core.triangulation_utils import (
 
 from slam.core.ba_utils import pose_only_ba, local_bundle_adjustment, global_bundle_adjustment
 
-import logging
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s") # INFO for clean summary, DEBUG for deep dive
-# logging.getLogger("two_view_bootstrap").setLevel(logging.DEBUG)
-# logging.getLogger("pnp").setLevel(logging.DEBUG)
-# logging.getLogger("multi_view").setLevel(logging.DEBUG)
-# logging.getLogger("triangulation").setLevel(logging.DEBUG)
-log = logging.getLogger("main").setLevel(logging.DEBUG)
-
 
 
 class BootstrapState:
@@ -115,7 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # feature/detector settings
     p.add_argument('--detector', choices=['orb', 'sift', 'akaze'],
                    default='orb')
-    p.add_argument('--matcher', choices=['bf'], default='bf')
+    p.add_argument('--matcher', choices=['bf', 'flann'], default='bf')
     p.add_argument('--use_lightglue', action='store_true')
     p.add_argument('--min_conf', type=float, default=0.7,
                    help='Minimum LightGlue confidence for a match')
@@ -132,7 +135,7 @@ def _build_parser() -> argparse.ArgumentParser:
                help='Min inlier ratio (to prev KF kps) before promoting KF')
     p.add_argument('--kf_min_rot_deg', type=float, default=8.0,
                help='Min rotation (deg) wrt prev KF to trigger KF')
-    p.add_argument('--kf_cooldown', type=int, default=5)
+    p.add_argument('--kf_cooldown', type=int, default=1)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2,
                    default=[640, 360])
     
@@ -141,12 +144,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.40) # 0.40
-    p.add_argument("--max_depth", type=float, default=float('inf'))
+    p.add_argument("--max_depth", type=float, default=100.0) # float('inf')
     p.add_argument('--mvt_rep_err', type=float, default=2.0,
                help='Max mean reprojection error (px) for multi-view triangulation')
 
     #  PnP / map-maintenance
-    p.add_argument('--pnp_min_inliers', type=int, default=15)
+    p.add_argument('--pnp_min_inliers', type=int, default=30)
     p.add_argument('--proj_radius',     type=float, default=10.0) # 12
     p.add_argument('--merge_radius',    type=float, default=0.10)
 
@@ -155,7 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Global BA
     p.add_argument('--gba_every', type=int, default=100, help='Run global BA every N frames')
-    p.add_argument('--gba_max_points', type=int, default=30000, help='Cap points in GBA (None = all)')
+    p.add_argument('--gba_max_points', type=int, default=None, help='Cap points in GBA (None = all)')
     p.add_argument('--gba_max_iters', type=int, default=30, help='Ceres iterations for GBA')
     p.add_argument('--gba_fix_first', type=int, default=1, help='1=fix first KF to anchor gauge, 0=free')
 
@@ -216,6 +219,11 @@ def main():
 
     new_ids:  list[int] = [] # list of new IDs for showing them in 3D viz
     total = len(seq) - 1
+
+    # --- Global BA ---
+    last_gba_kf_count = -1
+    do_gba = False
+
 
     for i in tqdm(range(total), desc='Tracking'):
 
@@ -445,6 +453,8 @@ def main():
             args, seq, i, img2, kp2, des2, Tcw_cur_pose, matcher, kfs, last_kf_frame_no
         )
         is_kf = (len(kfs) > prev_len)
+        if is_kf:
+            log.debug(f"[KF] Added KF #{kfs[-1].idx} @frame={kfs[-1].frame_idx} (total KFs={len(kfs)})")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
         # ------------------------------------------------------------------- #
@@ -481,6 +491,31 @@ def main():
         # --------------------------------------MISCELLANEOUS INFO ---------------------------------------------------
         # print(f"[traj2d] est={len(traj2d.est_xyz)} gt={len(traj2d.gt_xyz)}")
         # print(f"Frame {i+1}/{total}  |  FPS: {achieved_fps:.1f}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
+        # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
+
+        # ------------------------------------------------------------------- #
+        # --------------------- Global Bundle Adjustment ----------------------- #
+        # ------------------------------------------------------------------- #
+
+        # 2) One-time milestone trigger: when we FIRST reach 50 KFs
+        if len(kfs) % 50 == 0 and last_gba_kf_count != len(kfs):
+            do_gba = True
+        
+        if do_gba:
+            try:
+                pass
+                # log.info(f"[Global BA] Running global BA on {len(kfs)} KFs and {len(world_map.points)} points.")
+                # global_bundle_adjustment(
+                #     world_map, K, kfs,
+                #     fix_first=bool(int(args.gba_fix_first)),
+                #     max_points=(None if int(args.gba_max_points) <= 0 else int(args.gba_max_points)),
+                #     max_iters=int(args.gba_max_iters)
+                # )
+                do_gba = False
+                last_gba_kf_count = len(kfs)
+            except Exception as e:
+                log.warning(f"[BA] Global BA failed: {e}")
+            
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
         
