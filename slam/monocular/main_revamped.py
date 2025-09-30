@@ -524,16 +524,159 @@ def main():
         # ------------------------------------------------------------------- #
         if viz3d:
             viz3d.update(world_map, new_ids=new_ids)
+
+        # ---- helpers: LZ4->JPEG->BGR and safe conversions ------------------
+        import lz4.frame as lz4f
+
+        def _ensure_u8(img):
+            if img is None:
+                return None
+            if img.dtype == np.uint8:
+                return img
+            if np.issubdtype(img.dtype, np.floating) and img.max() <= 1.01:
+                img = img * 255.0
+            return np.clip(img, 0, 255).astype(np.uint8)
+
+        def _decode_jpeg(buf_like):
+            arr = np.frombuffer(buf_like, dtype=np.uint8)
+            return cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+
+        def _im_from_any(im):
+            """Return np.uint8 BGR image from: np.ndarray | (LZ4-)bytes | PIL."""
+            # 1) bytes? try LZ4 frame decompress first, then raw JPEG/PNG
+            if isinstance(im, (bytes, bytearray, memoryview)):
+                try:
+                    dec = lz4f.decompress(im)
+                    img = _decode_jpeg(dec)
+                    if img is not None:
+                        pass  # already decoded
+                except Exception:
+                    img = _decode_jpeg(im)  # maybe raw JPEG/PNG bytes
+                if img is None:
+                    return None
+            # 2) ndarray already
+            elif isinstance(im, np.ndarray):
+                img = im
+            # 3) maybe PIL.Image
+            else:
+                try:
+                    from PIL import Image
+                    if isinstance(im, Image.Image):
+                        img = np.array(im)
+                    else:
+                        return None
+                except Exception:
+                    return None
+
+            img = _ensure_u8(img)
+            if img is None:
+                return None
+            # Normalize to BGR
+            if img.ndim == 2:
+                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            if img.ndim == 3:
+                c = img.shape[2]
+                if c == 3:
+                    return img  # assume BGR (ok for display)
+                if c == 4:
+                    return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            return None
+
+        def _thumb(im, size_wh):
+            bgr = _im_from_any(im)
+            if bgr is None:
+                w, h = size_wh
+                return np.zeros((h, w, 3), dtype=np.uint8)
+            w, h = size_wh
+            return cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
+
+        # --- Make sure HighGUI is available and windows are created once ---
+        if 'HAS_HIGHGUI' not in globals():
+            globals()['HAS_HIGHGUI'] = True
+            try:
+                cv2.namedWindow("Strip: img2 + last 3 KFs", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("img2 + features", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("Strip: img2 + last 3 KFs", 1200, 380)
+                cv2.resizeWindow("img2 + features", 900, 600)
+                cv2.moveWindow("Strip: img2 + last 3 KFs", 40, 40)
+                cv2.moveWindow("img2 + features", 40, 460)
+            except Exception as e:
+                log.warning("[Viz] OpenCV HighGUI unavailable, disabling cv2 windows: %s", e)
+                globals()['HAS_HIGHGUI'] = False
+
+        # --- 1) Horizontal strip: [ current img2 | last 3 keyframes ] ---
+        # --- 2) img2 overlaid with ALL detected features (kp2)         ---
+        if globals().get('HAS_HIGHGUI', False):
+            try:
+                # Thumb size config (args.kf_thumb_hw expected as [w, h])
+                W_thumb, H_thumb = map(int, args.kf_thumb_hw)
+
+                # Current frame (bytes-safe)
+                cur_tile = _thumb(img2, (W_thumb, H_thumb))
+                cv2.putText(cur_tile, "cur frame", (8, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+                # Last 3 KFs — their .thumb is LZ4-compressed JPEG bytes
+                recent_kfs = kfs[-1:-4:-1] if len(kfs) > 0 else []
+                tiles = [cur_tile]
+                for kf in recent_kfs:
+                    th = None
+                    if getattr(kf, "thumb", None) is not None and len(kf.thumb) > 0:
+                        th = _thumb(kf.thumb, (W_thumb, H_thumb))
+                    elif getattr(kf, "path", ""):
+                        raw = cv2.imread(kf.path, cv2.IMREAD_UNCHANGED)
+                        th = _thumb(raw, (W_thumb, H_thumb))
+                    else:
+                        th = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+
+                    label = f"KF{getattr(kf, 'idx', '?')} (f{getattr(kf, 'frame_idx', '?')})"
+                    cv2.putText(th, label, (8, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                    tiles.append(th)
+
+                # Pad to 4 tiles total if <3 KFs exist
+                while len(tiles) < 4:
+                    tiles.append(np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8))
+
+                strip = cv2.hconcat([_im_from_any(t) for t in tiles])
+                cv2.imshow("Strip: img2 + last 3 KFs", strip)
+
+                # --- img2 with ALL detected features ---
+                feat_vis = _im_from_any(img2)
+                if feat_vis is None:
+                    feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+
+                feat_count = 0
+                if kp2 is not None and len(kp2) > 0:
+                    if hasattr(kp2[0], "pt"):
+                        for kp in kp2:
+                            x, y = map(int, kp.pt)
+                            cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+                        feat_count = len(kp2)
+                    else:
+                        pts = np.asarray(kp2).reshape(-1, 2)
+                        for x, y in pts.astype(int):
+                            cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+                        feat_count = len(pts)
+
+                cv2.putText(feat_vis, f"features: {feat_count}", (10, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.imshow("img2 + features", feat_vis)
+
+                # Make the windows actually refresh
+                cv2.waitKey(1)
+
+            except Exception as e:
+                log.exception("[Viz] HighGUI failed; disabling further cv2 windows.")
+                globals()['HAS_HIGHGUI'] = False
+
         # --- draw & UI control (end of iteration) ---
         traj2d.draw(paused=ui.paused)
-
-        ui.poll(1)  # non-blocking poll
+        ui.poll(1)
         if ui.should_quit():
             break
-
-        # If currently paused: block here until resume or do single-step
         if ui.paused:
-            did_step = ui.wait_if_paused()
+            _ = ui.wait_if_paused()
             # if user pressed 'n', did_step=True -> allow this iteration to exit;
             # next iteration will immediately pause again (nice for stepping).
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
