@@ -1,5 +1,5 @@
 # main.py
-#  MAIN: Frame-by-frame tracking using Essential/Fundamental only (NO PnP) + KLT (will do changes)
+#  MAIN: Frame-by-frame tracking using Essential/Homography only (NO PnP) + KLT (will do changes)
 """
 Entry-point: high-level processing loop
 --------------------------------------

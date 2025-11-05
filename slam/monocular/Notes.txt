@@ -9,3 +9,7 @@ Add KLT tracking,
 
 ask reddit, why handheld slam is so shit, compared to others
 maybe instead of using essential matrix, switch to using fundamental matrix based pose estimation
+
+--> Probe essential matrix why fucking it doesn't have inliers
+
+--> ONLY CHOICE: to make a more robust system for keyframe selection and only tracking on those keyframes, when you have enough baseline
