@@ -1,5 +1,5 @@
 # main.py
-#  MAIN: Frame-by-frame tracking using Essential/Fundamental only (NO PnP)
+#  MAIN: Frame-by-frame tracking using Essential/Fundamental only (NO PnP) + KLT (will do changes)
 """
 Entry-point: high-level processing loop
 --------------------------------------
@@ -25,7 +25,7 @@ import cv2
 import lz4.frame
 import numpy as np
 from tqdm import tqdm
-from typing import List
+from typing import List, Optional, Tuple
 import logging
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcName)s: %(message)s")
@@ -238,12 +238,38 @@ def main():
     traj2d = Trajectory2D(gt_T_list=gt_T if groundtruth is not None else None)
     ui = VizUI()  # p: pause/resume, n: step, q/Esc: quit
 
+    # --- KLT parameters ---
+    lk_win = int(getattr(args, "lk_win", 21))
+    lk_params = dict(
+        winSize=(lk_win, lk_win),
+        maxLevel=int(getattr(args, "lk_max_level", 3)),
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                  int(getattr(args, "lk_iter", 30)),
+                  float(getattr(args, "lk_eps", 1e-3))),
+        minEigThreshold=float(getattr(args, "lk_min_eig", 1e-4))
+    )
+    lk_err_thresh = float(getattr(args, "lk_err_thresh", 12.0))
+    lk_fb_thresh = float(getattr(args, "lk_fb_thresh", 1.5))
+    klt_viz_limit = int(getattr(args, "viz_klt_limit", 400))
+    klt_color_scale = float(getattr(args, "viz_klt_color_scale", 12.0))
+    klt_palette_size = max(1, int(getattr(args, "viz_klt_palette", 512)))
+    klt_palette_seed = int(getattr(args, "viz_klt_seed", 42))
+    klt_trail_decay = max(1, int(getattr(args, "viz_klt_trail_decay", 22)))
+    klt_color_palette = np.random.default_rng(klt_palette_seed).integers(
+        low=0, high=256, size=(klt_palette_size, 3), dtype=np.uint8
+    )
+
     # --- Keyframe Initialization ---
     kfs: list[Keyframe] = []
     last_kf_frame_no = -999
 
     new_ids:  list[int] = []  # for viz
     total = len(seq) - 1
+
+    latest_klt_tracks: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    latest_klt_counts: Tuple[int, int, int, int, int] = (0, 0, 0, 0, 0)
+    klt_trail_mask: Optional[np.ndarray] = None
+    klt_track_frame = 0
 
     # --------------- RECIPE: Frame-to-Frame tracking (copy/paste) -----------------
     # Every iteration (img1->img2):
@@ -335,6 +361,13 @@ def main():
                 kfs.extend([kf0, kf1])
                 last_kf_frame_no = cur_fidx
                 raw01 = feature_matcher(args, kfs[0].kps, kfs[1].kps, kfs[0].desc, kfs[1].desc, matcher)  # seed first pair links
+                # Seed KLT reference with the last KF image (KF1) in GRAY
+                try:
+                    prev_gray_klt = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2.copy()
+                except Exception:
+                    log.ex("Failed to convert initial KF image to grayscale for KLT.")
+                    prev_gray_klt = img2 if img2.ndim == 2 else cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+
             except Exception as e:
                 log.exception("[Init] Failed to create initial keyframes: %s", e)
 
@@ -350,72 +383,146 @@ def main():
         # ------------------------------------------------------------------- #
         # --------------------- Frame-to-Frame Tracking (E/F) --------------- #
         # ------------------------------------------------------------------- #
-        # 1) Match prev frame (img1) → current frame (img2)
-        tracking_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
-        tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, args.ransac_thresh)
+        klt_track_frame += 1
+        # 1) Track prev frame (img1) → current frame (img2) with KLT
+        latest_klt_tracks = None
+        pts0 = np.empty((0, 2), dtype=np.float32)
+        pts1 = np.empty((0, 2), dtype=np.float32)
 
-        if len(tracking_matches) < 8:
-            log.warning(f"[Track] Too few matches for E/F: {len(tracking_matches)}")
+        raw_count = len(kp1)
+        status_count = err_count = fb_count = 0
+
+        if len(kp1) >= 1:
+            img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if img1.ndim == 3 else img1
+            img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if img2.ndim == 3 else img2
+            prev_pts = np.float32([kp.pt for kp in kp1]).reshape(-1, 1, 2)
+            raw_count = prev_pts.shape[0]
+
+            try:
+                next_pts, st, err = cv2.calcOpticalFlowPyrLK(img1_gray, img2_gray, prev_pts, None, **lk_params)
+            except cv2.error as e:
+                log.warning(f"[KLT] calcOpticalFlowPyrLK failed: {e}")
+                next_pts = st = err = None
+            if next_pts is not None and st is not None:
+                status_mask = (st.reshape(-1) == 1)
+                status_count = int(status_mask.sum())
+                good = status_mask.copy()
+                err_mask = np.ones_like(status_mask, dtype=bool)
+                if err is not None:
+                    err_vals = err.reshape(-1)
+                    err_mask &= (err_vals < lk_err_thresh)
+                    good &= err_mask
+                err_count = int((status_mask & err_mask).sum())
+
+                fb_count = err_count
+                if good.any():
+                    back_pts, st_back, _ = cv2.calcOpticalFlowPyrLK(img2_gray, img1_gray, next_pts, None, **lk_params)
+                    if back_pts is not None and st_back is not None:
+                        st_back_mask = (st_back.reshape(-1) == 1)
+                        fb_err = np.linalg.norm(back_pts - prev_pts, axis=2).reshape(-1)
+                        fb_mask = st_back_mask & (fb_err < lk_fb_thresh)
+                        good &= fb_mask
+                        fb_count = int((status_mask & err_mask & fb_mask).sum())
+
+                if good.any():
+                    pts0 = prev_pts[good].reshape(-1, 2)
+                    pts1 = next_pts[good].reshape(-1, 2)
+                    latest_klt_tracks = (pts0.copy(), pts1.copy())
+
+        klt_kept_count = len(pts0)
+        latest_klt_counts = (raw_count, status_count, err_count, fb_count, klt_kept_count)
+        log.debug(
+            "[KLT] raw=%d st1=%d err_ok=%d fb_ok=%d kept=%d",
+            raw_count, status_count, err_count, fb_count, klt_kept_count
+        )
+
+        if klt_kept_count < 8 and des1 is not None and des2 is not None and len(des1) > 0 and len(des2) > 0:
+            tracking_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
+            tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, args.ransac_thresh)
+            if len(tracking_matches) >= 8:
+                pts0 = np.float32([kp1[m.queryIdx].pt for m in tracking_matches])
+                pts1 = np.float32([kp2[m.trainIdx].pt for m in tracking_matches])
+                log.debug(f"[Track] Descriptor fallback used; matches={len(tracking_matches)}, klt={klt_kept_count}")
+                latest_klt_tracks = (pts0.copy(), pts1.copy())
+
+        if len(pts0) < 8:
+            log.warning(f"[Track] Too few correspondences for E/F: {len(pts0)}")
             # Keep previous pose (dead-reckon); still push to traj for continuity
             world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
             traj2d.push(i + 1, Tcw_cur_pose)
         else:
-            pts0 = np.float32([kp1[m.queryIdx].pt for m in tracking_matches])
-            pts1 = np.float32([kp2[m.trainIdx].pt for m in tracking_matches])
-
             # Prefer Essential (calibrated); fall back to Fundamental
+            log.warning("[Track] E and H Tracking...")
+            # E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, args.ransac_thresh)
             E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, args.ransac_thresh)
+            H, Hinl = cv2.findHomography(pts0, pts1, cv2.RANSAC, 2.0)
+
+            nE = int(inlE.sum()) if inlE is not None else 0
+            nH = int(Hinl.sum()) if Hinl is not None else 0
             mask_pose = None
-            if E is not None and inlE is not None and int(inlE.sum()) >= 5:
+            log.debug(f"[Track] E inliers: {nE}, H inliers: {nH}")
+            if nH > nE * 1.5:
+                log.info(f"[Track] Using Homography for pose recovery (inliers: H={nH} > E={nE})")
+                # Rotation/planar: extract R from H
+                Hn = np.linalg.inv(K) @ H @ K
+                U, _, Vt = np.linalg.svd(Hn)
+                R = U @ Vt
+                if np.linalg.det(R) < 0: R = -R
+                t = None  # unreliable
+            else:
+                log.info(f"[Track] Using Essential for pose recovery (inliers: E={nE} >= H={nH})")
                 _, R, t, pose_mask = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
                 mask_pose = pose_mask
+
+            # Fundamental fallback
+            # F, inlF = cv2.findFundamentalMat(pts0, pts1, cv2.USAC_MAGSAC, args.ransac_thresh, 0.999)
+            # if F is None or inlF is None or int(inlF.sum()) < 7:
+            #     log.warning("[Track] E and F failed — keeping previous pose.")
+            #     world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+            #     traj2d.push(i + 1, Tcw_cur_pose)
+            #     # proceed to KF logic / viz as usual
+            # else:
+            #     # Upgrade F → E using calibration
+            #     E = K.T @ F @ K
+            #     _, R, t, pose_mask = cv2.recoverPose(E, pts0, pts1, K, mask=inlF)
+            #     mask_pose = pose_mask
+
+        if R is not None: #E is not None and mask_pose is not None:
+            # --- scale handling: inherit last baseline length ---
+            if len(world_map.poses) >= 2:
+                Tcw_prevprev = world_map.poses[-2]
+                Tcw_prev     = world_map.poses[-1]
+                T_prev_rel   = Tcw_prev @ np.linalg.inv(Tcw_prevprev)   # T_cw(k-1) * inv(T_cw(k-2))
+                last_baseline = _safe_norm(T_prev_rel[:3, 3])
             else:
-                # Fundamental fallback
-                F, inlF = cv2.findFundamentalMat(pts0, pts1, cv2.USAC_MAGSAC, 0.999, args.ransac_thresh)
-                if F is None or inlF is None or int(inlF.sum()) < 7:
-                    log.warning("[Track] E and F failed — keeping previous pose.")
-                    world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
-                    traj2d.push(i + 1, Tcw_cur_pose)
-                    # proceed to KF logic / viz as usual
-                else:
-                    # Upgrade F → E using calibration
-                    E = K.T @ F @ K
-                    _, R, t, pose_mask = cv2.recoverPose(E, pts0, pts1, K, mask=inlF)
-                    mask_pose = pose_mask
+                last_baseline = 1.0
+                log.warning("[Track] Using default baseline length.")
 
-            if E is not None and mask_pose is not None:
-                # --- scale handling: inherit last baseline length ---
-                if len(world_map.poses) >= 2:
-                    Tcw_prevprev = world_map.poses[-2]
-                    Tcw_prev     = world_map.poses[-1]
-                    T_prev_rel   = Tcw_prev @ np.linalg.inv(Tcw_prevprev)   # T_cw(k-1) * inv(T_cw(k-2))
-                    last_baseline = _safe_norm(T_prev_rel[:3, 3])
-                else:
-                    last_baseline = 1.0
+            last_baseline = 1.0
+            t = t.reshape(3, 1)
+            t = (t / _safe_norm(t)) * last_baseline
 
-                t = t.reshape(3, 1)
-                t = (t / _safe_norm(t)) * last_baseline
+            T_rel = _pose_rt_to_homogenous(R, t)      # T_c2c1
+            log.debug(f"[Track] Relative pose:\n{T_rel}")
+            Tcw_cur_pose = T_rel @ world_map.poses[-1]  # T_cw2 = T_c2c1 @ T_cw1
 
-                T_rel = _pose_rt_to_homogenous(R, t)      # T_c2c1
-                Tcw_cur_pose = T_rel @ world_map.poses[-1]  # T_cw2 = T_c2c1 @ T_cw1
+            world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+            traj2d.push(i + 1, Tcw_cur_pose)
 
-                world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
-                traj2d.push(i + 1, Tcw_cur_pose)
+            log.debug(f"[Track] E/F inliers={int(mask_pose.sum())} (KLT kept={klt_kept_count})")
 
-                log.debug(f"[Track] E/F inliers={int(mask_pose.sum())}")
-
-                # (Optional) quick visual of inlier tracks on img2
-                try:
-                    vis = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR) if img2.ndim == 2 else img2.copy()
-                    inl_idx = np.where(mask_pose.ravel() > 0)[0]
-                    for j in inl_idx:
-                        x0, y0 = map(int, pts0[j])
-                        x1, y1 = map(int, pts1[j])
-                        cv2.circle(vis, (x1, y1), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-                        cv2.line(vis, (x0, y0), (x1, y1), (0, 255, 0), 1, lineType=cv2.LINE_AA)
-                    cv2.imshow("E/F inlier tracks", vis)
-                except Exception:
-                    pass
+            # (Optional) quick visual of inlier tracks on img2
+            try:
+                vis = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR) if img2.ndim == 2 else img2.copy()
+                inl_idx = np.where(mask_pose.ravel() > 0)[0]
+                for j in inl_idx:
+                    x0, y0 = map(int, pts0[j])
+                    x1, y1 = map(int, pts1[j])
+                    cv2.circle(vis, (x1, y1), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+                    cv2.line(vis, (x0, y0), (x1, y1), (0, 255, 0), 1, lineType=cv2.LINE_AA)
+                cv2.imshow("E/F inlier tracks", vis)
+            except Exception:
+                pass
 
             # --- Pose-only BA on most recent KF (still useful; not PnP) ---
             try:
@@ -423,6 +530,8 @@ def main():
                     pose_only_ba(world_map, K, kfs, kf_idx=(len(kfs) - 1), max_iters=8, huber_thr=2.0)
             except Exception as e:
                 log.warning(f"[BA] Pose-only BA failed: {e}")
+
+
 
         # ------------------------------------------------------------------- #
         # ---------------------     Keyframe Selection  --------------------- #
@@ -532,10 +641,13 @@ def main():
             try:
                 cv2.namedWindow("Strip: img2 + last 3 KFs", cv2.WINDOW_NORMAL)
                 cv2.namedWindow("img2 + prev→cur matches", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("KLT optical flow", cv2.WINDOW_NORMAL)
                 cv2.resizeWindow("Strip: img2 + last 3 KFs", 1200, 380)
                 cv2.resizeWindow("img2 + prev→cur matches", 900, 600)
+                cv2.resizeWindow("KLT optical flow", 900, 600)
                 cv2.moveWindow("Strip: img2 + last 3 KFs", 40, 40)
                 cv2.moveWindow("img2 + prev→cur matches", 40, 460)
+                cv2.moveWindow("KLT optical flow", 960, 460)
             except Exception as e:
                 log.warning("[Viz] OpenCV HighGUI unavailable, disabling cv2 windows: %s", e)
                 globals()['HAS_HIGHGUI'] = False
@@ -576,9 +688,11 @@ def main():
                 cv2.imshow("Strip: img2 + last 3 KFs", strip)
 
                 # --- img2 with ONLY features matched to previous frame (img1) ---
-                feat_vis = _im_from_any(img2)
-                if feat_vis is None:
-                    feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+                feat_vis_base = _im_from_any(img2)
+                if feat_vis_base is None:
+                    feat_vis_base = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+
+                feat_vis = feat_vis_base.copy()
 
                 match_count = 0
                 if (kp1 is not None and kp2 is not None and
@@ -599,6 +713,34 @@ def main():
                 cv2.putText(feat_vis, f"prev→cur matches: {match_count}", (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow("img2 + prev→cur matches", feat_vis)
+
+                if klt_trail_mask is None or klt_trail_mask.shape != feat_vis_base.shape:
+                    klt_trail_mask = np.zeros_like(feat_vis_base)
+                elif (klt_track_frame % klt_trail_decay) == 0:
+                    klt_trail_mask[:] = 0
+                klt_frame = feat_vis_base.copy()
+                if latest_klt_tracks is not None:
+                    pts_prev, pts_cur = latest_klt_tracks
+                    if len(pts_prev) > klt_viz_limit > 0:
+                        idx = np.linspace(0, len(pts_prev) - 1, num=klt_viz_limit, dtype=int)
+                        pts_prev = pts_prev[idx]
+                        pts_cur = pts_cur[idx]
+                    for track_idx, ((x0, y0), (x1, y1)) in enumerate(zip(pts_prev, pts_cur)):
+                        color = tuple(int(v) for v in klt_color_palette[track_idx % klt_palette_size])
+                        p0 = (int(round(x0)), int(round(y0)))
+                        p1 = (int(round(x1)), int(round(y1)))
+                        mag = float(np.hypot(x1 - x0, y1 - y0))
+                        thickness = max(1, min(4, int(round(1 + mag / max(klt_color_scale, 1e-3)))))
+                        radius = max(2, min(6, thickness + 1))
+                        cv2.line(klt_trail_mask, p0, p1, color, thickness, lineType=cv2.LINE_AA)
+                        cv2.circle(klt_frame, p1, radius, color, -1, lineType=cv2.LINE_AA)
+
+                klt_vis = cv2.add(klt_frame, klt_trail_mask)
+                raw_cnt, st_cnt, err_cnt, fb_cnt, kept_cnt = latest_klt_counts
+                klt_text = f"KLT raw={raw_cnt} st={st_cnt} err={err_cnt} fb={fb_cnt} kept={kept_cnt}"
+                cv2.putText(klt_vis, klt_text, (10, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+                cv2.imshow("KLT optical flow", klt_vis)
 
                 # Make the windows actually refresh
                 cv2.waitKey(1)
