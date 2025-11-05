@@ -41,10 +41,18 @@ def _get_opencv_detector(detector_type, max_features=6000):
 
 
 def _get_opencv_matcher(matcher_type, detector_type):
-    if matcher_type != 'bf':
-        raise ValueError(f"Unsupported matcher: {matcher_type}")
-    norm = cv2.NORM_HAMMING if detector_type in ['orb', 'akaze'] else cv2.NORM_L2
-    return cv2.BFMatcher(norm, crossCheck=True)
+    # if matcher_type != 'bf' or matcher_type != 'flann':
+    #     raise ValueError(f"Unsupported matcher: {matcher_type}")
+    if matcher_type == 'flann':
+        # FLANN parameters
+        FLANN_INDEX_KDTREE = 1
+        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
+        search_params = dict(checks=50)   # or pass empty dictionary
+        flann = cv2.FlannBasedMatcher(index_params,search_params)
+        return flann
+    else:
+        norm = cv2.NORM_HAMMING if detector_type in ['orb', 'akaze'] else cv2.NORM_L2
+        return cv2.BFMatcher(norm, crossCheck=True)
 
 # --------------------------------------------------------------------------- #
 #  Individual feature extraction and matching functions

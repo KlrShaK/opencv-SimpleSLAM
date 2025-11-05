@@ -43,7 +43,8 @@ def load_sequence(args) -> List[str]:
         seq = sorted(glob.glob(os.path.join(img_dir, '*_left.jpg')))
 
     elif args.dataset == 'tum-rgbd':
-        img_dir = os.path.join(prefix, 'rgbd_dataset_freiburg1_room', 'rgb')
+        # img_dir = os.path.join(prefix, 'rgbd_dataset_freiburg1_room', 'rgb')
+        img_dir = os.path.join(prefix, 'rgbd_dataset_freiburg3_long_office_household', 'rgb')
         seq = sorted(glob.glob(os.path.join(img_dir, '*.png')))
 
     elif args.dataset == 'custom':
@@ -151,10 +152,16 @@ def _calib_malaga() -> Dict[str, np.ndarray]:
     return {'K_l': K_l, 'P_l': P_l, 'K_r': K_l.copy(), 'P_r': P_l.copy()}
 
 def _calib_tum():
-    K = np.array([[517.3, 0., 318.6],
-                  [0., 516.5, 255.3],
-                  [0.,   0.,    1. ]])
-    D = np.array([ 0.2624, -0.9531, 0.0054, 0.0026, -1.1633 ])   # d0-d4
+    # K = np.array([[517.3, 0.0, 318.6],
+    #               [0.0, 516.5, 255.3],
+    #               [0.0,   0.0,    1.0 ]])
+    # K = np.array([[520.9, 0.0, 325.1],
+    #               [0.0, 521.0, 249.7],
+    #               [0.0,   0.0,    1.0 ]])
+    K = np.array([[535.4, 0.0, 320.1],
+                  [0.0, 539.2, 247.6],
+                  [0.0,   0.0,    1.0 ]])
+    D = np.array([ 0.2624, -0.9531, 0.0054, 0.0026, -1.1633 ])   # d0-d4 # THESE ARE DISTORTION COEFFICIENTS
     P = np.hstack([K, np.zeros((3,1))])
     return {"K_l": K, "P_l": P, "D_l": D, "K_r":None, "P_r":None, "D_r":None}
 
@@ -225,7 +232,7 @@ def load_groundtruth(args) -> Optional[np.ndarray]:
         return _malaga_get_gt(filepath, seq)
     
     if args.dataset == "tum-rgbd":
-        seq_dir = os.path.join(prefix, "rgbd_dataset_freiburg1_room")
+        seq_dir = os.path.join(prefix, "rgbd_dataset_freiburg3_long_office_household")
         rgb_list = os.path.join(seq_dir, "rgb.txt")
         gt_file = os.path.join(seq_dir, "groundtruth.txt")
 
