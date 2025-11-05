@@ -1,0 +1,11 @@
+Line 437-460:
+After estimating essential matrix we are getting 
+log.debug(f"mask_pose: {mask_pose.ravel()}") ----- > All zeroes i.e no inlier
+Yet we get some garbage value pose updates which mess up everything
+
+
+Things to do :
+Add KLT tracking,
+
+ask reddit, why handheld slam is so shit, compared to others
+maybe instead of using essential matrix, switch to using fundamental matrix based pose estimation
