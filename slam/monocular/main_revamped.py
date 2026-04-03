@@ -78,7 +78,7 @@ from slam.core.triangulation_utils import (
     triangulate_between_kfs_2view
 )
 
-from slam.core.ba_utils import pose_only_ba, local_bundle_adjustment, global_bundle_adjustment
+from slam.core.ba_utils import local_bundle_adjustment, global_bundle_adjustment
 
 
 
@@ -105,6 +105,87 @@ def _refresh_ref_needed(matches, min_matches=80, max_age=30, cur_id=0, ref_id=0)
     if too_old: log.info(f"[Init] Refresh ref: age={cur_id-ref_id}>{max_age}")
     return too_few or too_old
 
+
+def _load_frame(seq, frame_idx: int, dataset: str):
+    if dataset == "custom":
+        return seq[frame_idx]
+    img = cv2.imread(seq[frame_idx], cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Failed to load frame {frame_idx}: {seq[frame_idx]}")
+    return img
+
+
+def _match_with_ransac(args, kp0, kp1, des0, des1, matcher):
+    if (
+        kp0 is None or kp1 is None or des0 is None or des1 is None
+        or len(kp0) == 0 or len(kp1) == 0
+        or len(des0) == 0 or len(des1) == 0
+    ):
+        return [], []
+    raw = feature_matcher(args, kp0, kp1, des0, des1, matcher)
+    return raw, filter_matches_ransac(kp0, kp1, raw, args.ransac_thresh)
+
+
+def _ensure_u8(img):
+    if img is None:
+        return None
+    if img.dtype == np.uint8:
+        return img
+    if np.issubdtype(img.dtype, np.floating) and img.max() <= 1.01:
+        img = img * 255.0
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _decode_jpeg(buf_like):
+    arr = np.frombuffer(buf_like, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+
+
+def _im_from_any(im):
+    """Return np.uint8 BGR image from: np.ndarray | (LZ4-)bytes | PIL."""
+    if isinstance(im, (bytes, bytearray, memoryview)):
+        try:
+            dec = lz4.frame.decompress(im)
+            img = _decode_jpeg(dec)
+            if img is None:
+                return None
+        except Exception:
+            img = _decode_jpeg(im)
+            if img is None:
+                return None
+    elif isinstance(im, np.ndarray):
+        img = im
+    else:
+        try:
+            from PIL import Image
+            if isinstance(im, Image.Image):
+                img = np.array(im)
+            else:
+                return None
+        except Exception:
+            return None
+
+    img = _ensure_u8(img)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3:
+        c = img.shape[2]
+        if c == 3:
+            return img
+        if c == 4:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return None
+
+
+def _thumb(im, size_wh):
+    bgr = _im_from_any(im)
+    if bgr is None:
+        w, h = size_wh
+        return np.zeros((h, w, 3), dtype=np.uint8)
+    return cv2.resize(bgr, size_wh, interpolation=cv2.INTER_AREA)
+
 # --------------------------------------------------------------------------- #
 #  CLI
 # --------------------------------------------------------------------------- #
@@ -122,6 +203,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--use_lightglue', action='store_true')
     p.add_argument('--min_conf', type=float, default=0.7,
                    help='Minimum LightGlue confidence for a match')
+    p.add_argument('--max_features', type=int, default=4000,
+                   help='Max features/keypoints for OpenCV detectors and ALIKED')
     # runtime
     p.add_argument('--fps', type=float, default=10)
 
@@ -155,6 +238,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Bundle Adjustment
     p.add_argument('--local_ba_window', type=int, default=10, help='Window size (number of keyframes) for local BA')
+    p.add_argument('--local_ba_min_new_points', type=int, default=60,
+                   help='Only run local BA when at least this many new landmarks were triangulated')
+    p.add_argument('--local_ba_max_points', type=int, default=5000,
+                   help='Cap landmarks included in local BA for runtime')
+    p.add_argument('--local_ba_max_iters', type=int, default=12,
+                   help='Maximum Ceres iterations for local BA')
 
     # Global BA
     p.add_argument('--gba_every', type=int, default=100, help='Run global BA every N frames')
@@ -169,7 +258,6 @@ def _build_parser() -> argparse.ArgumentParser:
 #  Main processing loop
 # --------------------------------------------------------------------------- #
 def main():
-    PAUSED = False
     args = _build_parser().parse_args()
 
     # --- Data loading ---
@@ -177,26 +265,18 @@ def main():
     calib       = load_calibration(args)        # dict with K_l, P_l, ...
     groundtruth = load_groundtruth(args)        # None or Nx3x4 array
     K = calib["K_l"]  # intrinsic matrix for left camera
-    P = calib["P_l"]  # projection matrix for left camera
 
     # ------ build 4×4 GT poses + alignment matrix (once) ----------------
     gt_T = None
-    R_align = t_align = None
     if groundtruth is not None:
         gt_T = np.pad(groundtruth, ((0, 0), (0, 1), (0, 0)), constant_values=0.0)
         gt_T[:, 3, 3] = 1.0                             # homogeneous 1s
-        R_align, t_align = compute_gt_alignment(gt_T)
+        compute_gt_alignment(gt_T)
 
     # --- feature pipeline (OpenCV / LightGlue) ---
     detector, matcher = init_feature_pipeline(args)
-
-
-    
     bs = BootstrapState()
 
-    # --- tracking state ---
-    prev_map, tracks = {}, {}
-    next_track_id = 0
     initialised = False
     tracking_lost = False
 
@@ -213,26 +293,22 @@ def main():
     kfs: list[Keyframe] = []
     last_kf_frame_no = -999
 
-    # --- visualisation ---
-    achieved_fps = 0.0
-    last_time = cv2.getTickCount() / cv2.getTickFrequency()
-
-    new_ids:  list[int] = [] # list of new IDs for showing them in 3D viz
-    total = len(seq) - 1
-
     # --- Global BA ---
     last_gba_kf_count = -1
     do_gba = False
 
+    total_frames = len(seq)
+    img_prev = _load_frame(seq, 0, args.dataset)
+    kp_prev, des_prev = feature_extractor(args, img_prev, detector)
 
-    for i in tqdm(range(total), desc='Tracking'):
-
-        # --- load image pair ---
-        img1, img2 = load_frame_pair(args, seq, i)
-
-        # --- feature extraction / matching ---
-        kp1, des1 = feature_extractor(args, img1, detector)
-        kp2, des2 = feature_extractor(args, img2, detector)
+    for frame_idx in tqdm(range(1, total_frames), desc='Tracking'):
+        img_cur = _load_frame(seq, frame_idx, args.dataset)
+        kp_cur, des_cur = feature_extractor(args, img_cur, detector)
+        new_ids: list[int] = []
+        # Compute frame-to-frame matches (prev→cur) once and reuse them for fallback/debug views.
+        _, prev_cur_matches = _match_with_ransac(
+            args, kp_prev, kp_cur, des_prev, des_cur, matcher
+        )
 
         # --------------------------------------------------------------------------- #
         # ------------------------ Bootstrap (delayed two-view) ------------------------------------------------
@@ -240,22 +316,25 @@ def main():
         if not initialised:
             # 1) Seed a reference frame the first time we get here
             if not bs.has_ref:
-                # use the *earlier* image/features as reference; your loop already has img1/img2, kp1/des1 & kp2/des2
-                bs.seed(kp1, des1, img1, frame_id=i)   # frame_id = i for img1
+                bs.seed(kp_prev, des_prev, img_prev, frame_id=frame_idx - 1)
+                img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
                 continue
 
             # 2) Match reference ↔ current using your existing pipeline
-            matches_bs = feature_matcher(args, bs.kps_ref, kp2, bs.des_ref, des2, matcher)
-            matches_bs = filter_matches_ransac(bs.kps_ref, kp2, matches_bs, args.ransac_thresh)
-            log.info(f"[Init] Matches ref→cur: raw={len(matches_bs)}  ransac_th={args.ransac_thresh:.2f}px")
+            raw_matches_bs, matches_bs = _match_with_ransac(
+                args, bs.kps_ref, kp_cur, bs.des_ref, des_cur, matcher
+            )
+            log.info("[Init] Matches ref→cur: raw=%d  ransac=%d  ransac_th=%.2fpx",
+                     len(raw_matches_bs), len(matches_bs), float(args.ransac_thresh))
 
             # Optional: refresh reference if matches are weak or ref is stale
-            if _refresh_ref_needed(matches_bs, min_matches=80, max_age=30, cur_id=i+1, ref_id=bs.frame_id_ref):
-                bs.seed(kp2, des2, img2, frame_id=i+1)
+            if _refresh_ref_needed(matches_bs, min_matches=80, max_age=30, cur_id=frame_idx, ref_id=bs.frame_id_ref):
+                bs.seed(kp_cur, des_cur, img_cur, frame_id=frame_idx)
+                img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
                 continue
 
             # 3) Build point arrays and evaluate the pair
-            pts_ref, pts_cur = pts_from_matches(bs.kps_ref, kp2, matches_bs)
+            pts_ref, pts_cur = pts_from_matches(bs.kps_ref, kp_cur, matches_bs)
             init_params = InitParams(
                 ransac_px=float(args.ransac_thresh),
                 min_posdepth=0.90,
@@ -266,6 +345,7 @@ def main():
             decision = evaluate_two_view_bootstrap_with_masks(K, pts_ref, pts_cur, init_params)
             if decision is None:
                 log.info("[Init] Pair rejected → waiting for a better one.")
+                img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
                 continue
 
             log.info(f"[Init] Accepted pair via {'H' if decision.pose.model.name=='HOMOGRAPHY' else 'F/E'}: "
@@ -275,7 +355,7 @@ def main():
             ok, T0_cw, T1_cw = bootstrap_two_view_map(
                 K,
                 bs.kps_ref, bs.des_ref,   # reference frame kps/desc
-                kp2, des2,                # current frame kps/desc
+                kp_cur, des_cur,          # current frame kps/desc
                 matches_bs,
                 args,
                 world_map,
@@ -284,6 +364,7 @@ def main():
             )
             if not ok:
                 log.warning("[Init] bootstrap_two_view_map() failed — keep searching.")
+                img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
                 continue
             
             # -------------BOOKKEEPING for Map and Keyframes---------------------
@@ -292,12 +373,10 @@ def main():
 
             # --- 2D Trajectory visualization bookkeeping ---
             traj2d.push(bs.frame_id_ref, T0_cw)
-            traj2d.push(i + 1, T1_cw)
+            traj2d.push(frame_idx, T1_cw)
             
             # --- Create the two initial Keyframes to mirror world_map KFs ---
             try:
-                # Be explicit about indices: world_map added KF0 first, then KF1.
-                # Keep kfs indices aligned (0, 1) to avoid confusion later.
                 if len(kfs) != 0:
                     log.warning("[Init] Expected empty kfs at bootstrap, found len=%d. "
                                 "Proceeding but indices may misalign.", len(kfs))
@@ -306,30 +385,27 @@ def main():
                 kf1_idx = kf0_idx + 1
 
                 # Resolve frame indices and image paths
-                ref_fidx = bs.frame_id_ref                         # you seeded with this earlier
-                cur_fidx = i + 1                                   # kp2/img2 correspond to i+1
+                ref_fidx = bs.frame_id_ref
+                cur_fidx = frame_idx
                 ref_path = seq[ref_fidx] if isinstance(seq[ref_fidx], str) else ""
                 cur_path = seq[cur_fidx] if isinstance(seq[cur_fidx], str) else ""
 
                 # Build thumbnails (guard if you disabled UI)
                 thumb0 = make_thumb(bs.img_ref, tuple(args.kf_thumb_hw)) if 'make_thumb' in globals() else None
-                thumb1 = make_thumb(img2,       tuple(args.kf_thumb_hw)) if 'make_thumb' in globals() else None
+                thumb1 = make_thumb(img_cur,    tuple(args.kf_thumb_hw)) if 'make_thumb' in globals() else None
 
                 # Create KF0 = Identity pose
-                kf0 = Keyframe(idx=kf0_idx, frame_idx=ref_fidx, path=ref_path, kps=bs.kps_ref, desc=bs.des_ref, pose=T0_cw, thumb=thumb0)
+                kf0 = Keyframe(idx=kf0_idx, frame_idx=ref_fidx, path=ref_path,
+                               kps=bs.kps_ref, desc=bs.des_ref, pose=T0_cw, thumb=thumb0)
 
                 # Create KF1 = bootstrap pose
-                kf1 = Keyframe(idx=kf1_idx, frame_idx=cur_fidx, path=cur_path, kps=kp2, desc=des2, pose=T1_cw, thumb=thumb1)
+                kf1 = Keyframe(idx=kf1_idx, frame_idx=cur_fidx, path=cur_path,
+                               kps=kp_cur, desc=des_cur, pose=T1_cw, thumb=thumb1)
 
                 kfs.extend([kf0, kf1])
                 last_kf_frame_no = cur_fidx   # the most recently added keyframe
                 log.info("[Init] Inserted initial keyframes: KF0(frame=%d, idx=%d) & KF1(frame=%d, idx=%d).",
                         ref_fidx, kf0_idx, cur_fidx, kf1_idx)
-
-
-                # and also seed their mutual matches (helps get first 3-view tracks quickly)
-                raw01 = feature_matcher(args, kfs[0].kps, kfs[1].kps, kfs[0].desc, kfs[1].desc, matcher)
-                # --- END --- 
 
             except Exception as e:
                 log.exception("[Init] Failed to create initial keyframes: %s", e)
@@ -344,113 +420,107 @@ def main():
 
             Tcw_cur_pose = T1_cw.copy()   # current camera pose (optional)
             bs.clear()
+            img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
             continue
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
         # ------------------------------------------------------------------- #
         # --------------------- Frame-to-Map Tracking ----------------------- #
         # ------------------------------------------------------------------- #
-        # When initialised, use constant-velocity prediction, reproject, search, PnP.
-        if initialised:
-            # 1) Predict pose with constant velocity using last two poses
-            if len(world_map.poses) >= 2:
-                Tcw_prevprev = world_map.poses[-2]
-                Tcw_prev     = world_map.poses[-1]
-                Tcw_pred     = predict_pose_const_vel(Tcw_prevprev, Tcw_prev)
-            else:
-                Tcw_pred     = Tcw_cur_pose
+        # 1) Predict the current pose from the last two camera poses.
+        if len(world_map.poses) >= 2:
+            Tcw_prevprev = world_map.poses[-2]
+            Tcw_prev     = world_map.poses[-1]
+            Tcw_pred     = predict_pose_const_vel(Tcw_prevprev, Tcw_prev)
+        else:
+            Tcw_pred     = Tcw_cur_pose
 
-            # 2) Reproject active points and do small-window matching
-            H, W = img2.shape[:2]
-            m23d = reproject_and_match_2d3d(
-                world_map, K, Tcw_pred, kp2, des2, W, H,
-                radius_px=float(args.proj_radius),  # CLI param
-                max_hamm=64
+        # 2) Reproject active map points and do small-window matching.
+        H, W = img_cur.shape[:2]
+        tracking_lost = False
+        m23d = reproject_and_match_2d3d(
+            world_map, K, Tcw_pred, kp_cur, des_cur, W, H,
+            radius_px=float(args.proj_radius),  # CLI param
+            max_hamm=64
+        )
+
+        log.debug(f"[Track] candidates for PnP: {len(m23d.pts3d)}")
+
+        # 3) PnP+RANSAC
+        if len(m23d.pts3d) >= int(args.pnp_min_inliers):
+            Tcw_est, inl_mask = solve_pnp_ransac(
+                m23d.pts3d, m23d.pts2d, K,
+                ransac_px=float(args.ransac_thresh),
+                Tcw_init=Tcw_pred,
+                iters=300, conf=0.999
             )
+            ninl = int(inl_mask.sum()) if inl_mask.size else 0
+           # NOTE Could be converted to a function - because it is used again below in the tracking-lost case
+            if Tcw_est is not None and ninl >= int(args.pnp_min_inliers):
+                Tcw_cur_pose = Tcw_est
+                world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
 
-            log.debug(f"[Track] candidates for PnP: {len(m23d.pts3d)}")
+                # --- 2D Trajectory visualization bookkeeping ---
+                traj2d.push(frame_idx, Tcw_cur_pose)
 
-            # 3) PnP+RANSAC
-            if len(m23d.pts3d) >= int(args.pnp_min_inliers):
-                Tcw_est, inl_mask = solve_pnp_ransac(
-                    m23d.pts3d, m23d.pts2d, K,
-                    ransac_px=float(args.ransac_thresh),
-                    Tcw_init=Tcw_pred,
-                    iters=300, conf=0.999
-                )
-                ninl = int(inl_mask.sum()) if inl_mask.size else 0
+                log.debug(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
 
-                # NOTE Could be converted to a function - because it is used again below in the tracking-lost case
-                if Tcw_est is not None and ninl >= int(args.pnp_min_inliers):
-                    Tcw_cur_pose = Tcw_est
-                    world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+                # Optional: quick visual sanity overlay (comment out if headless)
+                try:
+                    dbg = draw_reprojection_debug(img_cur, K, Tcw_cur_pose, m23d, inl_mask)
+                    cv2.imshow("Track debug", dbg)
+                except Exception:
+                    pass
 
-                    # --- 2D Trajectory visualization bookkeeping ---
-                    traj2d.push(i + 1, Tcw_cur_pose)
-
-                    log.debug(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
-
-                    # Optional: quick visual sanity overlay (comment out if headless)
-                    try:
-                        dbg = draw_reprojection_debug(img2, K, Tcw_cur_pose, m23d, inl_mask)
-                        cv2.imshow("Track debug", dbg)
-                        # if cv2.waitKey(int(1000.0/max(args.fps, 1e-6))) == 27:
-                        #     break # TODO REMOVE
-                    except Exception:
-                        pass
-
-                else:
-                    log.warning(f"[Track] PnP failed or too few inliers (got {ninl}). Tracking lost?")
-                    tracking_lost = True
             else:
-                log.warning(f"[Track] Too few 2D–3D matches for PnP ({len(m23d.pts3d)} < {args.pnp_min_inliers}).")
+                log.warning(f"[Track] PnP failed or too few inliers (got {ninl}). Tracking lost?")
                 tracking_lost = True
+        else:
+            log.warning(f"[Track] Too few 2D–3D matches for PnP ({len(m23d.pts3d)} < {args.pnp_min_inliers}).")
+            tracking_lost = True
 
-            # (Optional) if tracking_lost: trigger relocalization here in the future.
-            if tracking_lost:                      # fallback to 2-D-2-D if PnP failed
-                log.info(f"[Track] PnP failed, fallback to 2D-2D tracking.")
+        # (Optional) if tracking_lost: trigger relocalization here in the future.
+        if tracking_lost:                      # fallback to 2-D-2-D if PnP failed
+            log.info("[Track] PnP failed, fallback to 2D-2D tracking.")
+            fallback_inliers = 0
+            # 1) Frame-to-frame matching (prev frame -> current).
+            tracking_matches = prev_cur_matches
 
-                # 1) Frame-to-frame matching (prev frame -> current)
-                tracking_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
-                # (Optionally) light geometric filtering first
-                tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, args.ransac_thresh)
-
-                pts0 = np.float32([kp1[m.queryIdx].pt for m in tracking_matches])
-                pts1 = np.float32([kp2[m.trainIdx].pt  for m in tracking_matches])
+            if len(tracking_matches) >= 5:
+                pts0 = np.float32([kp_prev[m.queryIdx].pt for m in tracking_matches])
+                pts1 = np.float32([kp_cur[m.trainIdx].pt  for m in tracking_matches])
 
                 E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, args.ransac_thresh)
                 if E is not None and inlE is not None and int(inlE.sum()) >= 5:
-                    _, R, t, inlPose = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
-                    inl = inlPose.ravel().astype(bool)
-                log.debug(f"[Track] Fallback 2D-2D matches: raw={len(tracking_matches)}  inlE={int(inlE.sum()) if inlE is not None else 0}, inl={int(inl.sum()) if E is not None else 0}")
-                
-                _, R, t, mpose = cv2.recoverPose(E, pts0, pts1, K)
-                T_rel = _pose_rt_to_homogenous(R, t)   # c₁ → c₂
-                
-                # 2) Update current pose by relative motion into the world frame -------0---->>
-                Tcw_cur_pose = T_rel @ world_map.poses[-1]  # Tcw1 . Tc2c1 → T_cw2
-                world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
-                # --- 2D Trajectory visualization bookkeeping ---
-                traj2d.push(i + 1, Tcw_cur_pose)
-                log.debug(f"[Track] Pushed fallback pose, inliers={int(inl.sum()) if E is not None else 0}")
+                    fallback_inliers, R, t, inlPose = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
+                    fallback_inliers = int(fallback_inliers)
+                    log.debug(
+                        "[Track] Fallback 2D-2D matches: raw=%d  inlE=%d  inl=%d",
+                        len(tracking_matches),
+                        int(inlE.sum()) if inlE is not None else 0,
+                        fallback_inliers,
+                    )
+                    if fallback_inliers >= 5:
+                        T_rel = _pose_rt_to_homogenous(R, t)   # c₁ → c₂
+                        # 2) Compose the relative motion with the last world pose.
+                        Tcw_cur_pose = T_rel @ world_map.poses[-1]
+                        world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
+                        traj2d.push(frame_idx, Tcw_cur_pose)
+                        log.debug("[Track] Pushed fallback pose, inliers=%d", fallback_inliers)
+                        tracking_lost = False
 
-                tracking_lost = False
-
-            # TODO Recheck if placement is correct, NOTE usually pose only BA should happen on every tracking frame 
-            # --- BA pass 1: fast pose-only BA on current KF (uses its own obs) ---
-            try:
-                pose_only_ba(world_map, K, kfs, kf_idx=(len(kfs) - 1), max_iters=8, huber_thr=2.0)
-            except Exception as e:
-                log.warning(f"[BA] Pose-only BA failed: {e}")
+            if tracking_lost:
+                log.warning("[Track] Fallback 2D-2D tracking failed.")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
         
         
         # ------------------------------------------------------------------- #
         # ---------------------     Keyframe Selection  --------------------- #
         # ------------------------------------------------------------------- #
+        # Compare the current frame against the latest KF for keyframe insertion.
         prev_len = len(kfs)
         kfs, last_kf_frame_no = select_keyframe(
-            args, seq, i, img2, kp2, des2, Tcw_cur_pose, matcher, kfs, last_kf_frame_no
+            args, seq, frame_idx - 1, img_cur, kp_cur, des_cur, Tcw_cur_pose, matcher, kfs, last_kf_frame_no
         )
         is_kf = (len(kfs) > prev_len)
         if is_kf:
@@ -471,34 +541,32 @@ def main():
             if new_ids:
                 log.info("[Map] Triangulated %d new points after KF %d.", len(new_ids), curr_kf.idx)
 
-                # --- BA pass 2: local BA on a small KF window ---
-                try:
-                    local_bundle_adjustment(
-                        world_map, K, kfs,
-                        center_kf_idx=curr_kf.idx,
-                        window_size=int(getattr(args, "local_ba_window", 6)),
-                        max_points=10000,
-                        max_iters=15
-                    )
-                except Exception as e:
-                    log.warning(f"[BA] Local BA failed: {e}")
-
-                if viz3d:
-                    viz3d.update(world_map, new_ids=new_ids)
+                # Run local BA only when the new keyframe contributed enough landmark growth.
+                if len(new_ids) >= int(getattr(args, "local_ba_min_new_points", 0)):
+                    try:
+                        local_bundle_adjustment(
+                            world_map, K, kfs,
+                            center_kf_idx=curr_kf.idx,
+                            window_size=int(getattr(args, "local_ba_window", 6)),
+                            max_points=int(getattr(args, "local_ba_max_points", 5000)),
+                            max_iters=int(getattr(args, "local_ba_max_iters", 12))
+                        )
+                    except Exception as e:
+                        log.warning(f"[BA] Local BA failed: {e}")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
 
         # --------------------------------------MISCELLANEOUS INFO ---------------------------------------------------
         # print(f"[traj2d] est={len(traj2d.est_xyz)} gt={len(traj2d.gt_xyz)}")
-        # print(f"Frame {i+1}/{total}  |  FPS: {achieved_fps:.1f}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
+        # print(f"Frame {frame_idx}/{total_frames - 1}  |  KFs: {len(kfs)}  |  Map points: {len(world_map.points)}")
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
 
         # ------------------------------------------------------------------- #
         # --------------------- Global Bundle Adjustment ----------------------- #
         # ------------------------------------------------------------------- #
 
-        # 2) One-time milestone trigger: when we FIRST reach 50 KFs
-        if len(kfs) % 50 == 0 and last_gba_kf_count != len(kfs):
+        gba_every = int(getattr(args, "gba_every", 0))
+        if gba_every > 0 and len(kfs) > 0 and len(kfs) % gba_every == 0 and last_gba_kf_count != len(kfs):
             do_gba = True
         
         if do_gba:
@@ -525,71 +593,6 @@ def main():
         if viz3d:
             viz3d.update(world_map, new_ids=new_ids)
 
-        # ---- helpers: LZ4->JPEG->BGR and safe conversions ------------------
-        import lz4.frame as lz4f
-
-        def _ensure_u8(img):
-            if img is None:
-                return None
-            if img.dtype == np.uint8:
-                return img
-            if np.issubdtype(img.dtype, np.floating) and img.max() <= 1.01:
-                img = img * 255.0
-            return np.clip(img, 0, 255).astype(np.uint8)
-
-        def _decode_jpeg(buf_like):
-            arr = np.frombuffer(buf_like, dtype=np.uint8)
-            return cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-
-        def _im_from_any(im):
-            """Return np.uint8 BGR image from: np.ndarray | (LZ4-)bytes | PIL."""
-            # 1) bytes? try LZ4 frame decompress first, then raw JPEG/PNG
-            if isinstance(im, (bytes, bytearray, memoryview)):
-                try:
-                    dec = lz4f.decompress(im)
-                    img = _decode_jpeg(dec)
-                    if img is not None:
-                        pass  # already decoded
-                except Exception:
-                    img = _decode_jpeg(im)  # maybe raw JPEG/PNG bytes
-                if img is None:
-                    return None
-            # 2) ndarray already
-            elif isinstance(im, np.ndarray):
-                img = im
-            # 3) maybe PIL.Image
-            else:
-                try:
-                    from PIL import Image
-                    if isinstance(im, Image.Image):
-                        img = np.array(im)
-                    else:
-                        return None
-                except Exception:
-                    return None
-
-            img = _ensure_u8(img)
-            if img is None:
-                return None
-            # Normalize to BGR
-            if img.ndim == 2:
-                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            if img.ndim == 3:
-                c = img.shape[2]
-                if c == 3:
-                    return img  # assume BGR (ok for display)
-                if c == 4:
-                    return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return None
-
-        def _thumb(im, size_wh):
-            bgr = _im_from_any(im)
-            if bgr is None:
-                w, h = size_wh
-                return np.zeros((h, w, 3), dtype=np.uint8)
-            w, h = size_wh
-            return cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-
         # --- Make sure HighGUI is available and windows are created once ---
         if 'HAS_HIGHGUI' not in globals():
             globals()['HAS_HIGHGUI'] = True
@@ -612,7 +615,7 @@ def main():
                 W_thumb, H_thumb = map(int, args.kf_thumb_hw)
 
                 # Current frame (bytes-safe)
-                cur_tile = _thumb(img2, (W_thumb, H_thumb))
+                cur_tile = _thumb(img_cur, (W_thumb, H_thumb))
                 cv2.putText(cur_tile, "cur frame", (8, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
@@ -642,27 +645,16 @@ def main():
                 cv2.imshow("Strip: img2 + last 3 KFs", strip)
 
                 # --- img2 with ONLY features matched to previous frame (img1) ---
-                feat_vis = _im_from_any(img2)
+                feat_vis = _im_from_any(img_cur)
                 if feat_vis is None:
                     feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
 
-                match_count = 0
-                if (kp1 is not None and kp2 is not None and
-                    des1 is not None and des2 is not None and
-                    len(kp1) > 0 and len(kp2) > 0):
+                # Reuse the cached frame-to-frame matches computed at the top of the loop.
+                for m in prev_cur_matches:
+                    x, y = map(int, kp_cur[m.trainIdx].pt)
+                    cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
 
-                    # Compute prev→cur matches and filter geometrically
-                    viz_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
-                    viz_matches = filter_matches_ransac(kp1, kp2, viz_matches, args.ransac_thresh)
-
-                    # Draw only the matched keypoints in img2
-                    for m in viz_matches:
-                        x, y = map(int, kp2[m.trainIdx].pt)
-                        cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-
-                    match_count = len(viz_matches)
-
-                cv2.putText(feat_vis, f"prev→cur matches: {match_count}", (10, 24),
+                cv2.putText(feat_vis, f"prev→cur matches: {len(prev_cur_matches)}", (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                 cv2.imshow("img2 + prev→cur matches", feat_vis)
 
@@ -682,6 +674,7 @@ def main():
             _ = ui.wait_if_paused()
             # if user pressed 'n', did_step=True -> allow this iteration to exit;
             # next iteration will immediately pause again (nice for stepping).
+        img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
     
     if viz3d:
