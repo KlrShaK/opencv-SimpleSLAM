@@ -22,10 +22,10 @@ def init_feature_pipeline(args):
     """
     if args.use_lightglue:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        detector = ALIKED(max_num_keypoints=2048).eval().to(device)
+        detector = ALIKED(max_num_keypoints=int(getattr(args, "max_features", 4000))).eval().to(device)
         matcher  = LightGlue(features='aliked').eval().to(device)
     else:
-        detector = _get_opencv_detector(args.detector)
+        detector = _get_opencv_detector(args.detector, max_features=int(getattr(args, "max_features", 6000)))
         matcher  = _get_opencv_matcher(args.matcher, args.detector)
     return detector, matcher
 
@@ -34,7 +34,7 @@ def _get_opencv_detector(detector_type, max_features=6000):
     if detector_type == 'orb':
         return cv2.ORB_create(max_features)
     if detector_type == 'sift':
-        return cv2.SIFT_create()
+        return cv2.SIFT_create(nfeatures=max_features)
     if detector_type == 'akaze':
         return cv2.AKAZE_create()
     raise ValueError(f"Unsupported detector: {detector_type}")
@@ -115,6 +115,14 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
         * LightGlue path: NumPy float32 (from ALIKE) or torch float32
         * BF path: uint8 (ORB)
     """
+    if (
+        des0 is None or des1 is None
+        or kp0 is None or kp1 is None
+        or len(kp0) == 0 or len(kp1) == 0
+        or len(des0) == 0 or len(des1) == 0
+    ):
+        return []
+
     if args.use_lightglue:
         import torch
 
@@ -123,7 +131,6 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
             dev = next(matcher.parameters()).device
         except StopIteration:
             dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        matcher = matcher.to(dev).eval()
 
         # --- 2) Helpers to put inputs on the same device & dtype ---
         def _to_torch_float32(x):
@@ -143,8 +150,6 @@ def feature_matcher(args, kp0, kp1, des0, des1, matcher):
         lg_kp1 = k1.to(dev, dtype=torch.float32).unsqueeze(0)  # [1, N, 2]
 
         # descriptors: accept numpy or torch, move to dev, add batch dim
-        if des0 is None or des1 is None:
-            return []  # nothing to match
         lg_desc0 = _to_torch_float32(des0).unsqueeze(0)        # [1, M, D]
         lg_desc1 = _to_torch_float32(des1).unsqueeze(0)        # [1, N, D]
 
@@ -189,6 +194,8 @@ def filter_matches_ransac(kp1, kp2, matches, thresh=1.0):
 
     _, mask = cv2.findFundamentalMat(pts1, pts2,
                                      cv2.FM_RANSAC, thresh, 0.99)
+    if mask is None:
+        return []
     mask = mask.ravel().astype(bool)
     return [m for m, ok in zip(matches, mask) if ok]
 

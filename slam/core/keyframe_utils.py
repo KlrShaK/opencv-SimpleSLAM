@@ -141,6 +141,14 @@ def select_keyframe(
         return kfs, last_kf_frame_no
 
     prev_kf = kfs[-1]
+    rot_deg = 0.0
+    if prev_kf.pose is not None and Tcw_curr is not None:
+        rot_deg = _rot_deg_from_Tcw(prev_kf.pose, Tcw_curr)
+
+    # Skip the expensive KF→frame descriptor matching when the frame is still
+    # inside the keyframe cooldown and below the rotation gate.
+    if (frame_no - last_kf_frame_no) <= args.kf_cooldown and rot_deg < getattr(args, "kf_min_rot_deg", 8.0):
+        return kfs, last_kf_frame_no
 
     raw_matches = feature_matcher(args, prev_kf.kps, kp2, prev_kf.desc, des2, matcher)
     matches = filter_matches_ransac(prev_kf.kps, kp2, raw_matches, args.ransac_thresh)
