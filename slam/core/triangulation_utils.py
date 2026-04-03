@@ -51,6 +51,16 @@ def _angle_parallax_deg(K, uv1, uv2):
     return float(np.degrees(np.arccos(c)))
 
 
+def _angle_parallax_deg_batch(K_inv: np.ndarray, uv1: np.ndarray, uv2: np.ndarray) -> np.ndarray:
+    """Vectorised parallax angles for Nx2 pixel coordinate arrays."""
+    rays1 = (K_inv @ np.c_[uv1, np.ones(len(uv1), dtype=np.float64)].T).T
+    rays2 = (K_inv @ np.c_[uv2, np.ones(len(uv2), dtype=np.float64)].T).T
+    rays1 /= np.linalg.norm(rays1, axis=1, keepdims=True) + 1e-12
+    rays2 /= np.linalg.norm(rays2, axis=1, keepdims=True) + 1e-12
+    cosang = np.clip(np.sum(rays1 * rays2, axis=1), -1.0, 1.0)
+    return np.degrees(np.arccos(cosang))
+
+
 def _map_add_point(world_map, Xw, desc, obs_list):
     """
     Insert one 3-D point into Map and add its observations.
@@ -116,6 +126,7 @@ def triangulate_between_kfs_2view(
 
     # 1) Build point arrays (Nx2) in pixel coords
     pts1, pts2 = pts_from_matches(prev_kf.kps, cur_kf.kps, matches)
+    K_inv = np.linalg.inv(K)
 
     # 2) Projection matrices
     P1 = _P_from_K_Tcw(K, prev_kf.pose)
@@ -146,13 +157,11 @@ def triangulate_between_kfs_2view(
     examples_shown = 0
 
     # Precompute optional parallax stats for a quick sense of geometry
+    all_parallaxes = None
     if use_parallax_gate:
-        sample_parallaxes = []
-        for m in matches[:200]:  # sample for speed
-            uv1 = prev_kf.kps[m.queryIdx].pt
-            uv2 = cur_kf.kps[m.trainIdx].pt
-            sample_parallaxes.append(_angle_parallax_deg(K, uv1, uv2))
-        if sample_parallaxes:
+        all_parallaxes = _angle_parallax_deg_batch(K_inv, pts1.astype(np.float64), pts2.astype(np.float64))
+        sample_parallaxes = all_parallaxes[:200]
+        if sample_parallaxes.size:
             log.info("[TRI] Parallax(sample of %d): med=%.2f°, p25=%.2f°, p75=%.2f°",
                      len(sample_parallaxes),
                      float(np.median(sample_parallaxes)),
@@ -162,17 +171,35 @@ def triangulate_between_kfs_2view(
     # 5) Iterate matches and corresponding 3D points
     min_d = float(getattr(args, "min_depth", 0.0))
     max_d = float(getattr(args, "max_depth", 1e6))
+    pts1_valid = pts1[idx_valid]
+    pts2_valid = pts2[idx_valid]
+
+    Xc1 = (R1 @ X.T + t1.reshape(3, 1)).T
+    Xc2 = (R2 @ X.T + t2.reshape(3, 1)).T
+    z1_all = Xc1[:, 2]
+    z2_all = Xc2[:, 2]
+    front1 = z1_all > 1e-6
+    front2 = z2_all > 1e-6
+
+    e1_all = np.full(len(X), np.inf, dtype=np.float64)
+    e2_all = np.full(len(X), np.inf, dtype=np.float64)
+    if np.any(front1):
+        u1h = (K @ (Xc1[front1] / z1_all[front1, None]).T).T[:, :2]
+        e1_all[front1] = np.linalg.norm(u1h - pts1_valid[front1], axis=1)
+    if np.any(front2):
+        u2h = (K @ (Xc2[front2] / z2_all[front2, None]).T).T[:, :2]
+        e2_all[front2] = np.linalg.norm(u2h - pts2_valid[front2], axis=1)
 
     for out_idx, m_idx in enumerate(idx_valid):
         Xw = X[out_idx]
         m = matches[m_idx]
         i1, i2 = m.queryIdx, m.trainIdx
-        uv1 = prev_kf.kps[i1].pt
-        uv2 = cur_kf.kps[i2].pt
+        uv1 = pts1_valid[out_idx]
+        uv2 = pts2_valid[out_idx]
 
         # (a) Optional parallax gate
         if use_parallax_gate:
-            par = _angle_parallax_deg(K, uv1, uv2)
+            par = float(all_parallaxes[m_idx])
             if par < parallax_min_deg:
                 reasons["low_parallax"] += 1
                 if examples_shown < debug_max_examples:
@@ -180,8 +207,8 @@ def triangulate_between_kfs_2view(
                 continue
 
         # (b) Cheirality + depth window
-        z1 = (R1 @ Xw + t1)[2]
-        z2 = (R2 @ Xw + t2)[2]
+        z1 = float(z1_all[out_idx])
+        z2 = float(z2_all[out_idx])
         if not (min_d <= z1 <= max_d and min_d <= z2 <= max_d):
             reasons["bad_depth"] += 1
             if examples_shown < debug_max_examples:
@@ -189,16 +216,14 @@ def triangulate_between_kfs_2view(
             continue
 
         # (c) Reprojection gate
-        u1h = _project_px(K, R1, t1, Xw)
-        u2h = _project_px(K, R2, t2, Xw)
-        if (u1h is None) or (u2h is None):
+        if (not front1[out_idx]) or (not front2[out_idx]):
             reasons["behind_cam"] += 1
             if examples_shown < debug_max_examples:
-                log_tri.debug("reject: behind_cam  u1h=%s u2h=%s", str(u1h), str(u2h))
+                log_tri.debug("reject: behind_cam  z1=%.3f z2=%.3f", z1, z2)
             continue
 
-        e1 = float(np.linalg.norm(u1h - uv1))
-        e2 = float(np.linalg.norm(u2h - uv2))
+        e1 = float(e1_all[out_idx])
+        e2 = float(e2_all[out_idx])
         if max(e1, e2) > reproj_px_max:
             reasons["high_reproj"] += 1
             if examples_shown < debug_max_examples:
@@ -217,7 +242,7 @@ def triangulate_between_kfs_2view(
 
         if examples_shown < debug_max_examples:
             log_tri.debug("kept pid=%d  par=%.2f°  z1=%.2f z2=%.2f  e1=%.2f e2=%.2f", pid,
-                          _angle_parallax_deg(K, uv1, uv2) if use_parallax_gate else -1.0, z1, z2, e1, e2)
+                          float(all_parallaxes[m_idx]) if use_parallax_gate else -1.0, z1, z2, e1, e2)
         examples_shown += 1
 
     # 6) Summary
