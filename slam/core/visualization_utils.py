@@ -292,9 +292,10 @@ class Trajectory2D:
         self.est_xyz: list[np.ndarray] = []   # estimated camera centers (world)
         self.gt_xyz:  list[np.ndarray] = []   # paired GT centers
         self.align_ok = False
-        self.s = 0.1 #5.40 kitti # 0.1 # 1.45 # initial guess
+        self.s = 2.0 #5.40 kitti # 0.1 # 1.45 # initial guess
         self.R = np.eye(3)
         self.t = np.zeros(3)
+        self.min_view_span = 10.0
 
         # small OpenCV 'ghost' window so cv2.waitKey in VizUI keeps working
         # (keep it tiny and unobtrusive)
@@ -319,9 +320,11 @@ class Trajectory2D:
         self.ax.grid(True, which="both", alpha=0.3)
         self.ax.set_aspect("equal", adjustable="box")
 
-        # line objects for fast updates
-        (self.line_est,) = self.ax.plot([], [], lw=2, label="estimate")
-        (self.line_gt,)  = self.ax.plot([], [], lw=2, label="ground-truth")
+        # Draw GT first and keep EST on top so trajectory overlap stays readable.
+        (self.line_gt,)  = self.ax.plot([], [], lw=2, ls="--", color="0.45", alpha=0.85,
+                                        label="ground-truth", zorder=2)
+        (self.line_est,) = self.ax.plot([], [], lw=2.5, color="tab:blue",
+                                        label="estimate", zorder=3)
 
         # text overlay for alignment scale + status
         self.info_text = self.ax.text(
@@ -360,6 +363,24 @@ class Trajectory2D:
             self.gt_xyz.append(self.gt_T[frame_idx][:3, 3].astype(np.float64))
         # self._maybe_update_alignment(Kpairs=min(100, len(self.est_xyz))) # TODO: TEMPORARY - UNCOMMENT WHEN YOU WANT ALIGNMENT
 
+    def _square_view_limits(self, all_x: np.ndarray, all_z: np.ndarray, margin_frac: float):
+        minx, maxx = all_x.min(), all_x.max()
+        minz, maxz = all_z.min(), all_z.max()
+
+        spanx = max(maxx - minx, 1e-6)
+        spanz = max(maxz - minz, 1e-6)
+        target_span = max(spanx, spanz, self.min_view_span)
+        half_span = 0.5 * target_span * (1.0 + 2.0 * margin_frac)
+
+        center_x = 0.5 * (minx + maxx)
+        center_z = 0.5 * (minz + maxz)
+        return (
+            center_x - half_span,
+            center_x + half_span,
+            center_z - half_span,
+            center_z + half_span,
+        )
+
     def draw(self, paused: bool = False, margin_frac: float = 0.05):
         # nothing to draw yet
         if not self.est_xyz:
@@ -381,18 +402,9 @@ class Trajectory2D:
         else:
             all_x = E[:, 0]; all_z = E[:, 2]
 
-        # Pad bounds a little
-        minx, maxx = all_x.min(), all_x.max()
-        minz, maxz = all_z.min(), all_z.max()
-        spanx = max(maxx - minx, 1e-6)
-        spanz = max(maxz - minz, 1e-6)
-        pad_x = margin_frac * spanx
-        pad_z = margin_frac * spanz
-
-        # self.ax.set_xlim(minx - pad_x - 50, maxx + pad_x + 50)  # extra horiz. space for legend
-        # self.ax.set_ylim(minz - pad_z - 30, maxz + pad_z + 30)
-        self.ax.set_xlim(minx - pad_x, maxx + pad_x)  # extra horiz. space for legend
-        self.ax.set_ylim(minz - pad_z, maxz + pad_z)
+        minx, maxx, minz, maxz = self._square_view_limits(all_x, all_z, margin_frac)
+        self.ax.set_xlim(minx, maxx)
+        self.ax.set_ylim(minz, maxz)
 
 
         # Update lines: plot x vs z
@@ -493,4 +505,3 @@ class VizUI:
             self._do_step = False
             return True
         return False
-
