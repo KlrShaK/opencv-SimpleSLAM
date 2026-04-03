@@ -595,17 +595,17 @@ def main():
             globals()['HAS_HIGHGUI'] = True
             try:
                 cv2.namedWindow("Strip: img2 + last 3 KFs", cv2.WINDOW_NORMAL)
-                cv2.namedWindow("img2 + features", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("img2 + prev→cur matches", cv2.WINDOW_NORMAL)
                 cv2.resizeWindow("Strip: img2 + last 3 KFs", 1200, 380)
-                cv2.resizeWindow("img2 + features", 900, 600)
+                cv2.resizeWindow("img2 + prev→cur matches", 900, 600)
                 cv2.moveWindow("Strip: img2 + last 3 KFs", 40, 40)
-                cv2.moveWindow("img2 + features", 40, 460)
+                cv2.moveWindow("img2 + prev→cur matches", 40, 460)
             except Exception as e:
                 log.warning("[Viz] OpenCV HighGUI unavailable, disabling cv2 windows: %s", e)
                 globals()['HAS_HIGHGUI'] = False
 
         # --- 1) Horizontal strip: [ current img2 | last 3 keyframes ] ---
-        # --- 2) img2 overlaid with ALL detected features (kp2)         ---
+        # --- 2) img2 overlaid with ONLY prev→cur matched features       ---
         if globals().get('HAS_HIGHGUI', False):
             try:
                 # Thumb size config (args.kf_thumb_hw expected as [w, h])
@@ -641,27 +641,30 @@ def main():
                 strip = cv2.hconcat([_im_from_any(t) for t in tiles])
                 cv2.imshow("Strip: img2 + last 3 KFs", strip)
 
-                # --- img2 with ALL detected features ---
+                # --- img2 with ONLY features matched to previous frame (img1) ---
                 feat_vis = _im_from_any(img2)
                 if feat_vis is None:
                     feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
 
-                feat_count = 0
-                if kp2 is not None and len(kp2) > 0:
-                    if hasattr(kp2[0], "pt"):
-                        for kp in kp2:
-                            x, y = map(int, kp.pt)
-                            cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-                        feat_count = len(kp2)
-                    else:
-                        pts = np.asarray(kp2).reshape(-1, 2)
-                        for x, y in pts.astype(int):
-                            cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-                        feat_count = len(pts)
+                match_count = 0
+                if (kp1 is not None and kp2 is not None and
+                    des1 is not None and des2 is not None and
+                    len(kp1) > 0 and len(kp2) > 0):
 
-                cv2.putText(feat_vis, f"features: {feat_count}", (10, 24),
+                    # Compute prev→cur matches and filter geometrically
+                    viz_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
+                    viz_matches = filter_matches_ransac(kp1, kp2, viz_matches, args.ransac_thresh)
+
+                    # Draw only the matched keypoints in img2
+                    for m in viz_matches:
+                        x, y = map(int, kp2[m.trainIdx].pt)
+                        cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+
+                    match_count = len(viz_matches)
+
+                cv2.putText(feat_vis, f"prev→cur matches: {match_count}", (10, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow("img2 + features", feat_vis)
+                cv2.imshow("img2 + prev→cur matches", feat_vis)
 
                 # Make the windows actually refresh
                 cv2.waitKey(1)

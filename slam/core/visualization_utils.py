@@ -292,7 +292,7 @@ class Trajectory2D:
         self.est_xyz: list[np.ndarray] = []   # estimated camera centers (world)
         self.gt_xyz:  list[np.ndarray] = []   # paired GT centers
         self.align_ok = False
-        self.s = 1.45 # initial guess
+        self.s = 0.1 #5.40 kitti # 0.1 # 1.45 # initial guess
         self.R = np.eye(3)
         self.t = np.zeros(3)
 
@@ -389,8 +389,11 @@ class Trajectory2D:
         pad_x = margin_frac * spanx
         pad_z = margin_frac * spanz
 
-        self.ax.set_xlim(minx - pad_x - 50, maxx + pad_x + 50)  # extra horiz. space for legend
-        self.ax.set_ylim(minz - pad_z - 30, maxz + pad_z + 30)
+        # self.ax.set_xlim(minx - pad_x - 50, maxx + pad_x + 50)  # extra horiz. space for legend
+        # self.ax.set_ylim(minz - pad_z - 30, maxz + pad_z + 30)
+        self.ax.set_xlim(minx - pad_x, maxx + pad_x)  # extra horiz. space for legend
+        self.ax.set_ylim(minz - pad_z, maxz + pad_z)
+
 
         # Update lines: plot x vs z
         self.line_est.set_data(E[:, 0], E[:, 2])

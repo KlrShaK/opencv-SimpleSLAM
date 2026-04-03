@@ -25,21 +25,23 @@ set -e
 #   # --no_viz3d
 
 
-# # TEST
-# python3 -m slam.monocular.main_revamped  \
-#   --dataset kitti \
+# TEST
+# python3 -m slam.monocular.main4 \
+#   --dataset tum-rgbd \
 #   --base_dir ./Dataset \
-#   --detector orb \
+#   --detector akaze \
 #   --matcher bf \
-#   --fps 10 \
-#   --ransac_thresh 1.0 \
-
-#   --no_viz3d
+#   --no_viz3d 
+#   # --use_lightglue \
+#   # --no_viz3d 
+#   # --fps 10 \
+#   # --no_viz3d
 
 
 python3 -m slam.monocular.main_revamped \
-  --dataset tum-rgbd \
+  --dataset kitti \
   --base_dir ./Dataset \
   --use_lightglue \
+  --no_viz3d
   # --fps 10 \
   # --no_viz3d
