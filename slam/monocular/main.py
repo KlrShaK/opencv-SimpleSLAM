@@ -263,6 +263,7 @@ def main():
 
         # --- load image pair ---
         img1, img2 = load_frame_pair(args, seq, i)
+        img1, img2 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY), cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
         # img2 = img1.copy() # shift img2 by few pixels to simulate motion
         # img2 = shift_image(img2, dx=10, dy=0, border="edge")  # simulate rightward motion
         # print(type(img2))
@@ -350,9 +351,41 @@ def main():
         # ------------------------------------------------------------------- #
         # --------------------- Frame-to-Frame Tracking (E/F) --------------- #
         # ------------------------------------------------------------------- #
+        # ---- helpers (place once near top) ----
+        def _median_parallax_deg(K, pts0, pts1, R, mask=None):
+            Kinv = np.linalg.inv(K)
+            p0 = np.hstack([pts0, np.ones((len(pts0),1))]); p1 = np.hstack([pts1, np.ones((len(pts1),1))])
+            u0 = (Kinv @ p0.T).T; u1 = (Kinv @ p1.T).T
+            if mask is not None:
+                keep = mask.ravel() > 0
+                if keep.sum() >= 5: u0, u1 = u0[keep], u1[keep]
+            u0 /= np.linalg.norm(u0, axis=1, keepdims=True)
+            u1 /= np.linalg.norm(u1, axis=1, keepdims=True)
+            Ru0 = (R @ u0.T).T
+            ang = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", Ru0, u1), -1.0, 1.0)))
+            return float(np.median(ang)) if ang.size else 180.0
+
+        def _decompose_h_best(H, K, pts0, pts1, inl_mask):
+            inl = inl_mask.ravel() > 0
+            if inl.sum() < 4: return None, None, inl, 0
+            N, Rs, ts, ns = cv2.decomposeHomographyMat(H, K)
+            if N == 0: return None, None, inl, 0
+            P0 = K @ np.hstack([np.eye(3), np.zeros((3,1))])
+            p0, p1 = pts0[inl].T, pts1[inl].T
+            best, cnt_best = (None, None), -1
+            for R, t, _ in zip(Rs, ts, ns):
+                P1 = K @ np.hstack([R, t.reshape(3,1)])
+                X = cv2.triangulatePoints(P0, P1, p0, p1); X = (X[:3]/X[3]).T
+                z0 = X[:,2]; z1 = (R @ X.T + t.reshape(3,1))[2]
+                cnt = int(((z0>0)&(z1>0)).sum())
+                if cnt > cnt_best:
+                    best, cnt_best = (R, t.reshape(3,1)), cnt
+            return best[0], best[1], inl, cnt_best
+        # ---------------------------------------
+
         # 1) Match prev frame (img1) → current frame (img2)
         tracking_matches = feature_matcher(args, kp1, kp2, des1, des2, matcher)
-        tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, args.ransac_thresh)
+        tracking_matches = filter_matches_ransac(kp1, kp2, tracking_matches, thresh=1.0)
 
         if len(tracking_matches) < 8:
             log.warning(f"[Track] Too few matches for E/F: {len(tracking_matches)}")
@@ -363,46 +396,71 @@ def main():
             pts0 = np.float32([kp1[m.queryIdx].pt for m in tracking_matches])
             pts1 = np.float32([kp2[m.trainIdx].pt for m in tracking_matches])
 
-            # Prefer Essential (calibrated); fall back to Fundamental
-            E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, args.ransac_thresh)
             mask_pose = None
-            if E is not None and inlE is not None and int(inlE.sum()) >= 5:
-                _, R, t, pose_mask = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
-                mask_pose = pose_mask
-            else:
-                # Fundamental fallback
-                F, inlF = cv2.findFundamentalMat(pts0, pts1, cv2.USAC_MAGSAC, 0.999, args.ransac_thresh)
-                if F is None or inlF is None or int(inlF.sum()) < 7:
-                    log.warning("[Track] E and F failed — keeping previous pose.")
-                    world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
-                    traj2d.push(i + 1, Tcw_cur_pose)
-                    # proceed to KF logic / viz as usual
-                else:
-                    # Upgrade F → E using calibration
-                    E = K.T @ F @ K
-                    _, R, t, pose_mask = cv2.recoverPose(E, pts0, pts1, K, mask=inlF)
-                    mask_pose = pose_mask
+            # Prefer Essential (calibrated); fall back to Fundamental
+            R_E, t_E, pose_mask_E = None, None, None
+            E, inlE = cv2.findEssentialMat(pts0, pts1, K, cv2.RANSAC, 0.999, threshold=3.0)
+            nE = 0 if inlE is None else int(inlE.sum())
+            if E is not None and inlE is not None and nE >= 8:
+                _, R_E, t_E, pose_mask_E = cv2.recoverPose(E, pts0, pts1, K, mask=inlE)
+                mask_pose = pose_mask_E
 
-            if E is not None and mask_pose is not None:
-                # --- scale handling: inherit last baseline length ---
+            R_H, t_H, pose_mask_H, cnt_H = None, None, None, 0
+            H, inlH = cv2.findHomography(pts0, pts1, cv2.RANSAC, ransacReprojThreshold=2.0, confidence=0.995)
+            nH = 0 if inlH is None else int(inlH.sum())
+            if H is not None and inlH is not None and nH >= 4:
+                R_H, t_H, pose_mask_H, cnt_H = _decompose_h_best(H, K, pts0, pts1, inlH)
+            else: 
+                pose_mask_H = np.zeros(len(pts0), dtype=bool)
+
+            parallax_E = _median_parallax_deg(K, pts0, pts1, R_E, mask=pose_mask_E) if R_E is not None else 999.0
+            parallax_H = _median_parallax_deg(K, pts0, pts1, R_H, mask=inlH) if R_H is not None else 999.0
+            log.debug(f"[Track] inliers E={nE}, H={nH}, parE={parallax_E:.2f}°, parH={parallax_H:.2f}°")
+
+            # 3) Choose model
+            parallax_thr = 1.2
+            use_rot_only = (nH >= max(30, int(1.1*nE)) and parallax_H <= parallax_thr) or (R_E is not None and parallax_E <= parallax_thr and nH >= max(20, int(0.8*nE))) # TODO: MAGIC VARIABLE parallax_thr
+            # use_rot_only = not use_rot_only
+            updated = False
+            if use_rot_only and R_H is not None:
+                # rotation-only update
+                R, t = R_H, np.zeros((3,1))
+                T_rel = _pose_rt_to_homogenous(R, t)
+                Tcw_cur_pose = T_rel @ world_map.poses[-1]
+                world_map.add_pose(Tcw_cur_pose, is_keyframe=False); traj2d.push(i+1, Tcw_cur_pose)
+                updated = True
+                # (optional) draw H inliers…
+                mask_pose = inlH # pose_mask_H # also try inlH
+                log.debug(f"[Track] E/F inliers={int(mask_pose.sum())}")
+                log.debug(f"[Track] Using rotation-only update (H)") 
+
+            elif (R_E is not None) and (int(mask_pose.sum()) > 0) and nE >= 5:
+                # translation case, scale from last baseline (your existing logic)
                 if len(world_map.poses) >= 2:
-                    Tcw_prevprev = world_map.poses[-2]
-                    Tcw_prev     = world_map.poses[-1]
-                    T_prev_rel   = Tcw_prev @ np.linalg.inv(Tcw_prevprev)   # T_cw(k-1) * inv(T_cw(k-2))
-                    last_baseline = _safe_norm(T_prev_rel[:3, 3])
+                    # Tcw_pp, Tcw_p = world_map.poses[-2], world_map.poses[-1]
+                    # T_prev_rel = Tcw_p @ np.linalg.inv(Tcw_pp)
+                    # last_baseline = _safe_norm(T_prev_rel[:3,3])
+                    last_baseline = 1.0
                 else:
                     last_baseline = 1.0
 
-                t = t.reshape(3, 1)
-                t = (t / _safe_norm(t)) * last_baseline
-
-                T_rel = _pose_rt_to_homogenous(R, t)      # T_c2c1
-                Tcw_cur_pose = T_rel @ world_map.poses[-1]  # T_cw2 = T_c2c1 @ T_cw1
-
+                t = (t_E.reshape(3,1) / _safe_norm(t_E)) * last_baseline
+                T_rel = _pose_rt_to_homogenous(R_E, t)
+                Tcw_cur_pose = T_rel @ world_map.poses[-1]
                 world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
-                traj2d.push(i + 1, Tcw_cur_pose)
-
+                traj2d.push(i+1, Tcw_cur_pose)
+                updated = True
+                # (optional) draw E inliers…
+                mask_pose = pose_mask_E
+                log.debug(f"mask_pose: {mask_pose.ravel()}")
                 log.debug(f"[Track] E/F inliers={int(mask_pose.sum())}")
+                log.debug(f"[Track] Using full R+t update (E)")
+                log.debug(f"translation t (scaled) = {t.ravel()}")
+                log.debug(f"rotation R = \n{R_E}")
+            
+            if not updated:
+                log.warning("[Track] E/H (and fallback) failed — keeping previous pose.")
+                world_map.add_pose(Tcw_cur_pose, is_keyframe=False); traj2d.push(i+1, Tcw_cur_pose)
 
                 # (Optional) quick visual of inlier tracks on img2
                 try:
@@ -414,8 +472,9 @@ def main():
                         cv2.circle(vis, (x1, y1), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
                         cv2.line(vis, (x0, y0), (x1, y1), (0, 255, 0), 1, lineType=cv2.LINE_AA)
                     cv2.imshow("E/F inlier tracks", vis)
+                    cv2.waitKey(1)
                 except Exception:
-                    pass
+                    log.debug("[Track] Failed to draw E/F inlier tracks.")
 
             # --- Pose-only BA on most recent KF (still useful; not PnP) ---
             try:
@@ -447,7 +506,7 @@ def main():
                 reproj_px_max=float(args.ransac_thresh)
             )
             if new_ids:
-                log.info("[Map] Triangulated %d new points after KF %d.", len(new_ids), curr_kf.idx)
+                log.debug("[Map] Triangulated %d new points after KF %d.", len(new_ids), curr_kf.idx)
                 try:
                     local_bundle_adjustment(
                         world_map, K, kfs,
