@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s:%(funcN
 # logging.getLogger("triangulation").setLevel(logging.DEBUG)
 # logging.getLogger("ba").setLevel(logging.DEBUG)
 log = logging.getLogger("main")
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 
 from slam.core.pose_utils import _pose_inverse, _pose_rt_to_homogenous
@@ -218,7 +218,7 @@ def _build_parser() -> argparse.ArgumentParser:
                help='Min inlier ratio (to prev KF kps) before promoting KF')
     p.add_argument('--kf_min_rot_deg', type=float, default=8.0,
                help='Min rotation (deg) wrt prev KF to trigger KF')
-    p.add_argument('--kf_cooldown', type=int, default=1)
+    p.add_argument('--kf_cooldown', type=int, default=5)
     p.add_argument('--kf_thumb_hw', type=int, nargs=2,
                    default=[640, 360])
     
@@ -266,6 +266,10 @@ def main():
     groundtruth = load_groundtruth(args)        # None or Nx3x4 array
     K = calib["K_l"]  # intrinsic matrix for left camera
 
+    # --- Undistort images if distortion coefficients are available ---
+    D = calib.get("D_l", None)
+    undist_maps = None
+
     # ------ build 4×4 GT poses + alignment matrix (once) ----------------
     gt_T = None
     if groundtruth is not None:
@@ -299,10 +303,22 @@ def main():
 
     total_frames = len(seq)
     img_prev = _load_frame(seq, 0, args.dataset)
+    # Build undistortion maps once (if D is non-zero) and apply to first frame
+    if D is not None and np.any(D != 0):
+        H0, W0 = img_prev.shape[:2]
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (W0, H0), alpha=0, newImgSize=(W0, H0))
+        mapx, mapy = cv2.initUndistortRectifyMap(K, D, None, new_K, (W0, H0), cv2.CV_32FC1)
+        K = new_K
+        undist_maps = (mapx, mapy)
+        img_prev = cv2.remap(img_prev, mapx, mapy, cv2.INTER_LINEAR)
+        log.info("[Init] Undistortion enabled — updated K to new optimal camera matrix.")
+    
     kp_prev, des_prev = feature_extractor(args, img_prev, detector)
 
     for frame_idx in tqdm(range(1, total_frames), desc='Tracking'):
         img_cur = _load_frame(seq, frame_idx, args.dataset)
+        if undist_maps is not None:
+            img_cur = cv2.remap(img_cur, undist_maps[0], undist_maps[1], cv2.INTER_LINEAR)
         kp_cur, des_cur = feature_extractor(args, img_cur, detector)
         new_ids: list[int] = []
         # Compute frame-to-frame matches (prev→cur) once and reuse them for fallback/debug views.
@@ -338,7 +354,7 @@ def main():
             init_params = InitParams(
                 ransac_px=float(args.ransac_thresh),
                 min_posdepth=0.90,
-                min_parallax_deg=1.5,
+                min_parallax_deg=0.5,
                 score_ratio_H=0.45
             )
             # Decide with masks (no redundancy later)
@@ -502,6 +518,16 @@ def main():
                     )
                     if fallback_inliers >= 5:
                         T_rel = _pose_rt_to_homogenous(R, t)   # c₁ → c₂
+                        # Scale fallback translation by expected magnitude from
+                        # constant velocity — recoverPose returns unit-norm t
+                        # which injects huge fake translations in rotation-dominant
+                        # motion (e.g. TUM-RGBD indoor scenes).
+                        if len(world_map.poses) >= 2:
+                            T_rp = world_map.poses[-1] @ _pose_inverse(world_map.poses[-2])
+                            expected_t = np.linalg.norm(T_rp[:3, 3])
+                            T_rel[:3, 3] = t.ravel() * expected_t
+                        else:
+                            T_rel[:3, 3] = 0.0
                         # 2) Compose the relative motion with the last world pose.
                         Tcw_cur_pose = T_rel @ world_map.poses[-1]
                         world_map.add_pose(Tcw_cur_pose, is_keyframe=False)
