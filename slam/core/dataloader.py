@@ -161,7 +161,9 @@ def _calib_tum():
     K = np.array([[535.4, 0.0, 320.1],
                   [0.0, 539.2, 247.6],
                   [0.0,   0.0,    1.0 ]])
-    D = np.array([ 0.2624, -0.9531, 0.0054, 0.0026, -1.1633 ])   # d0-d4 # THESE ARE DISTORTION COEFFICIENTS
+    # NOTE: fr3 images are pre-rectified (zero distortion).
+    # The previous values [0.2624, -0.9531, ...] were from fr1 — wrong for fr3.
+    D = np.zeros(5, dtype=np.float64)
     P = np.hstack([K, np.zeros((3,1))])
     return {"K_l": K, "P_l": P, "D_l": D, "K_r":None, "P_r":None, "D_r":None}
 
