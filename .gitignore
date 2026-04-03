@@ -179,3 +179,4 @@ cython_debug/
 
 # ignore backup code folder
 /slam_(copy)/
+.codex
