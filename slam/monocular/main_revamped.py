@@ -224,6 +224,8 @@ def _build_parser() -> argparse.ArgumentParser:
     
     # 3‑D visualisation toggle
     p.add_argument("--no_viz3d", action="store_true", help="Disable 3‑D visualization window")
+    p.add_argument("--headless", action="store_true",
+                   help="Disable ALL visualization during the run; save trajectory graph at the end")
 
     # triangulation depth filtering
     p.add_argument("--min_depth", type=float, default=0.40) # 0.40
@@ -289,9 +291,10 @@ def main():
     Tcw_cur_pose = np.eye(4)  # camera-from-world (identity at t=0)
 
     # --- Visualization  ---
-    viz3d = None if args.no_viz3d else Visualizer3D(color_axis="y")
+    headless = getattr(args, "headless", False)
+    viz3d = None if (args.no_viz3d or headless) else Visualizer3D(color_axis="y")
     traj2d = Trajectory2D(gt_T_list=gt_T if groundtruth is not None else None)
-    ui = VizUI()  # p: pause/resume, n: step, q/Esc: quit
+    ui = None if headless else VizUI()  # p: pause/resume, n: step, q/Esc: quit
 
     # --- Keyframe Initialization ---
     kfs: list[Keyframe] = []
@@ -481,12 +484,12 @@ def main():
 
                 log.debug(f"[Track] PnP inliers={ninl}  (th={args.ransac_thresh:.1f}px)")
 
-                # Optional: quick visual sanity overlay (comment out if headless)
-                try:
-                    dbg = draw_reprojection_debug(img_cur, K, Tcw_cur_pose, m23d, inl_mask)
-                    cv2.imshow("Track debug", dbg)
-                except Exception:
-                    pass
+                if not headless:
+                    try:
+                        dbg = draw_reprojection_debug(img_cur, K, Tcw_cur_pose, m23d, inl_mask)
+                        cv2.imshow("Track debug", dbg)
+                    except Exception:
+                        pass
 
             else:
                 log.warning(f"[Track] PnP failed or too few inliers (got {ninl}). Tracking lost?")
@@ -616,95 +619,109 @@ def main():
         # ------------------------------------------------------------------- #
         # --------------------- Visualization ----------------------- #
         # ------------------------------------------------------------------- #
-        if viz3d:
-            viz3d.update(world_map, new_ids=new_ids)
+        if not headless:
+            if viz3d:
+                viz3d.update(world_map, new_ids=new_ids)
 
-        # --- Make sure HighGUI is available and windows are created once ---
-        if 'HAS_HIGHGUI' not in globals():
-            globals()['HAS_HIGHGUI'] = True
-            try:
-                cv2.namedWindow("Strip: img2 + last 3 KFs", cv2.WINDOW_NORMAL)
-                cv2.namedWindow("img2 + prev→cur matches", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Strip: img2 + last 3 KFs", 1200, 380)
-                cv2.resizeWindow("img2 + prev→cur matches", 900, 600)
-                cv2.moveWindow("Strip: img2 + last 3 KFs", 40, 40)
-                cv2.moveWindow("img2 + prev→cur matches", 40, 460)
-            except Exception as e:
-                log.warning("[Viz] OpenCV HighGUI unavailable, disabling cv2 windows: %s", e)
-                globals()['HAS_HIGHGUI'] = False
+            # --- Make sure HighGUI is available and windows are created once ---
+            if 'HAS_HIGHGUI' not in globals():
+                globals()['HAS_HIGHGUI'] = True
+                try:
+                    cv2.namedWindow("Strip: img2 + last 3 KFs", cv2.WINDOW_NORMAL)
+                    cv2.namedWindow("img2 + prev→cur matches", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("Strip: img2 + last 3 KFs", 1200, 380)
+                    cv2.resizeWindow("img2 + prev→cur matches", 900, 600)
+                    cv2.moveWindow("Strip: img2 + last 3 KFs", 40, 40)
+                    cv2.moveWindow("img2 + prev→cur matches", 40, 460)
+                except Exception as e:
+                    log.warning("[Viz] OpenCV HighGUI unavailable, disabling cv2 windows: %s", e)
+                    globals()['HAS_HIGHGUI'] = False
 
-        # --- 1) Horizontal strip: [ current img2 | last 3 keyframes ] ---
-        # --- 2) img2 overlaid with ONLY prev→cur matched features       ---
-        if globals().get('HAS_HIGHGUI', False):
-            try:
-                # Thumb size config (args.kf_thumb_hw expected as [w, h])
-                W_thumb, H_thumb = map(int, args.kf_thumb_hw)
+            # --- 1) Horizontal strip: [ current img2 | last 3 keyframes ] ---
+            # --- 2) img2 overlaid with ONLY prev→cur matched features       ---
+            if globals().get('HAS_HIGHGUI', False):
+                try:
+                    # Thumb size config (args.kf_thumb_hw expected as [w, h])
+                    W_thumb, H_thumb = map(int, args.kf_thumb_hw)
 
-                # Current frame (bytes-safe)
-                cur_tile = _thumb(img_cur, (W_thumb, H_thumb))
-                cv2.putText(cur_tile, "cur frame", (8, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+                    # Current frame (bytes-safe)
+                    cur_tile = _thumb(img_cur, (W_thumb, H_thumb))
+                    cv2.putText(cur_tile, "cur frame", (8, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
-                # Last 3 KFs — their .thumb is LZ4-compressed JPEG bytes
-                recent_kfs = kfs[-1:-4:-1] if len(kfs) > 0 else []
-                tiles = [cur_tile]
-                for kf in recent_kfs:
-                    th = None
-                    if getattr(kf, "thumb", None) is not None and len(kf.thumb) > 0:
-                        th = _thumb(kf.thumb, (W_thumb, H_thumb))
-                    elif getattr(kf, "path", ""):
-                        raw = cv2.imread(kf.path, cv2.IMREAD_UNCHANGED)
-                        th = _thumb(raw, (W_thumb, H_thumb))
-                    else:
-                        th = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+                    # Last 3 KFs — their .thumb is LZ4-compressed JPEG bytes
+                    recent_kfs = kfs[-1:-4:-1] if len(kfs) > 0 else []
+                    tiles = [cur_tile]
+                    for kf in recent_kfs:
+                        th = None
+                        if getattr(kf, "thumb", None) is not None and len(kf.thumb) > 0:
+                            th = _thumb(kf.thumb, (W_thumb, H_thumb))
+                        elif getattr(kf, "path", ""):
+                            raw = cv2.imread(kf.path, cv2.IMREAD_UNCHANGED)
+                            th = _thumb(raw, (W_thumb, H_thumb))
+                        else:
+                            th = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
 
-                    label = f"KF{getattr(kf, 'idx', '?')} (f{getattr(kf, 'frame_idx', '?')})"
-                    cv2.putText(th, label, (8, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-                    tiles.append(th)
+                        label = f"KF{getattr(kf, 'idx', '?')} (f{getattr(kf, 'frame_idx', '?')})"
+                        cv2.putText(th, label, (8, 24),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                        tiles.append(th)
 
-                # Pad to 4 tiles total if <3 KFs exist
-                while len(tiles) < 4:
-                    tiles.append(np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8))
+                    # Pad to 4 tiles total if <3 KFs exist
+                    while len(tiles) < 4:
+                        tiles.append(np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8))
 
-                strip = cv2.hconcat([_im_from_any(t) for t in tiles])
-                cv2.imshow("Strip: img2 + last 3 KFs", strip)
+                    strip = cv2.hconcat([_im_from_any(t) for t in tiles])
+                    cv2.imshow("Strip: img2 + last 3 KFs", strip)
 
-                # --- img2 with ONLY features matched to previous frame (img1) ---
-                feat_vis = _im_from_any(img_cur)
-                if feat_vis is None:
-                    feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
+                    # --- img2 with ONLY features matched to previous frame (img1) ---
+                    feat_vis = _im_from_any(img_cur)
+                    if feat_vis is None:
+                        feat_vis = np.zeros((H_thumb, W_thumb, 3), dtype=np.uint8)
 
-                # Reuse the cached frame-to-frame matches computed at the top of the loop.
-                for m in prev_cur_matches:
-                    x, y = map(int, kp_cur[m.trainIdx].pt)
-                    cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+                    # Reuse the cached frame-to-frame matches computed at the top of the loop.
+                    for m in prev_cur_matches:
+                        x, y = map(int, kp_cur[m.trainIdx].pt)
+                        cv2.circle(feat_vis, (x, y), 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
 
-                cv2.putText(feat_vis, f"prev→cur matches: {len(prev_cur_matches)}", (10, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow("img2 + prev→cur matches", feat_vis)
+                    cv2.putText(feat_vis, f"prev→cur matches: {len(prev_cur_matches)}", (10, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.imshow("img2 + prev→cur matches", feat_vis)
 
-                # Make the windows actually refresh
-                cv2.waitKey(1)
+                    # Make the windows actually refresh
+                    cv2.waitKey(1)
 
-            except Exception as e:
-                log.exception("[Viz] HighGUI failed; disabling further cv2 windows.")
-                globals()['HAS_HIGHGUI'] = False
+                except Exception as e:
+                    log.exception("[Viz] HighGUI failed; disabling further cv2 windows.")
+                    globals()['HAS_HIGHGUI'] = False
 
-        # --- draw & UI control (end of iteration) ---
-        traj2d.draw(paused=ui.paused)
-        ui.poll(1)
-        if ui.should_quit():
-            break
-        if ui.paused:
-            _ = ui.wait_if_paused()
-            # if user pressed 'n', did_step=True -> allow this iteration to exit;
-            # next iteration will immediately pause again (nice for stepping).
+            # --- draw & UI control (end of iteration) ---
+            traj2d.draw(paused=ui.paused)
+            ui.poll(1)
+            if ui.should_quit():
+                break
+            if ui.paused:
+                _ = ui.wait_if_paused()
+                # if user pressed 'n', did_step=True -> allow this iteration to exit;
+                # next iteration will immediately pause again (nice for stepping).
+
         img_prev, kp_prev, des_prev = img_cur, kp_cur, des_cur
         # --x------x----------x----------x----------x----x----x-- END -x----------x-----------x----------x----
-    
+
     if viz3d:
-        viz3d.close()    
+        viz3d.close()
+
+    # --- Final trajectory graph (always drawn; saved to file in headless mode) ---
+    import matplotlib.pyplot as plt
+    traj2d.draw()
+    out_path = f"trajectory_{args.dataset}.png"
+    traj2d.fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    log.info("[Done] Trajectory saved to %s", out_path)
+    if headless:
+        plt.close(traj2d.fig)
+    else:
+        plt.ioff()
+        plt.show()
 
 if __name__ == '__main__':
     main()
