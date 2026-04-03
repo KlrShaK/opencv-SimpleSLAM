@@ -51,13 +51,29 @@ def _angle_parallax_deg(K, uv1, uv2):
     return float(np.degrees(np.arccos(c)))
 
 
-def _angle_parallax_deg_batch(K_inv: np.ndarray, uv1: np.ndarray, uv2: np.ndarray) -> np.ndarray:
-    """Vectorised parallax angles for Nx2 pixel coordinate arrays."""
-    rays1 = (K_inv @ np.c_[uv1, np.ones(len(uv1), dtype=np.float64)].T).T
-    rays2 = (K_inv @ np.c_[uv2, np.ones(len(uv2), dtype=np.float64)].T).T
-    rays1 /= np.linalg.norm(rays1, axis=1, keepdims=True) + 1e-12
-    rays2 /= np.linalg.norm(rays2, axis=1, keepdims=True) + 1e-12
-    cosang = np.clip(np.sum(rays1 * rays2, axis=1), -1.0, 1.0)
+def _angle_parallax_deg_batch(K_inv: np.ndarray, R1: np.ndarray, R2: np.ndarray,
+                                     uv1: np.ndarray, uv2: np.ndarray) -> np.ndarray:
+    """Vectorised parallax angles in the WORLD frame (rotation-aware).
+
+    Transforms bearing vectors to the world frame before computing the angle,
+    giving the true triangulation parallax: zero for pure rotation, positive
+    only when a real baseline exists.  This prevents rotation-induced image
+    displacement from being mistaken for depth-producing parallax.
+
+    Parameters
+    ----------
+    K_inv : (3,3) inverse intrinsic matrix
+    R1, R2 : (3,3) camera-from-world rotation for each view
+    uv1, uv2 : (N,2) pixel coordinates in each view
+    """
+    rays1_cam = (K_inv @ np.c_[uv1, np.ones(len(uv1), dtype=np.float64)].T).T
+    rays2_cam = (K_inv @ np.c_[uv2, np.ones(len(uv2), dtype=np.float64)].T).T
+    # R is camera-from-world, so R.T transforms camera rays to world frame
+    rays1_w = (R1.T @ rays1_cam.T).T
+    rays2_w = (R2.T @ rays2_cam.T).T
+    rays1_w /= np.linalg.norm(rays1_w, axis=1, keepdims=True) + 1e-12
+    rays2_w /= np.linalg.norm(rays2_w, axis=1, keepdims=True) + 1e-12
+    cosang = np.clip(np.sum(rays1_w * rays2_w, axis=1), -1.0, 1.0)
     return np.degrees(np.arccos(cosang))
 
 
@@ -159,7 +175,9 @@ def triangulate_between_kfs_2view(
     # Precompute optional parallax stats for a quick sense of geometry
     all_parallaxes = None
     if use_parallax_gate:
-        all_parallaxes = _angle_parallax_deg_batch(K_inv, pts1.astype(np.float64), pts2.astype(np.float64))
+        all_parallaxes = _angle_parallax_deg_batch(
+            K_inv, R1, R2, pts1.astype(np.float64), pts2.astype(np.float64)
+        )
         sample_parallaxes = all_parallaxes[:200]
         if sample_parallaxes.size:
             log.info("[TRI] Parallax(sample of %d): med=%.2f°, p25=%.2f°, p75=%.2f°",
